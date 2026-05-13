@@ -667,17 +667,40 @@ namespace LibUA
                         arr.SetValue(v, i);
                     }
 
-                    res = arr;
-
-                    // Decoding multidimensional arrays is not supported, decode as a flat array.
                     if ((mask & 0x40) != 0)
                     {
                         if (!Decode(out int rank)) { return false; }
 
+                        int[] dims = new int[rank];
+                        int totalElements = 1;
                         for (int i = 0; i < rank; i++)
                         {
-                            if (!Decode(out int _)) { return false; }
+                            if (!Decode(out dims[i])) { return false; }
+                            totalElements *= dims[i];
                         }
+
+                        if (totalElements != arrLen)
+                        {
+                            return false;
+                        }
+
+                        var mdArr = Array.CreateInstance(type, dims);
+                        int[] indices = new int[rank];
+                        for (int i = 0; i < arrLen; i++)
+                        {
+                            int tmp = i;
+                            for (int d = rank - 1; d >= 0; d--)
+                            {
+                                indices[d] = tmp % dims[d];
+                                tmp /= dims[d];
+                            }
+                            mdArr.SetValue(arr.GetValue(i), indices);
+                        }
+                        res = mdArr;
+                    }
+                    else
+                    {
+                        res = arr;
                     }
                 }
                 else

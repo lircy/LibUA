@@ -981,6 +981,7 @@ namespace LibUA
             if (includeType)
             {
                 var posRestore = mem.Position;
+                eoFilterSize = (UInt32)(posRestore - eoFilterPos - 4);
                 mem.Position = eoFilterPos;
                 if (!mem.Encode(eoFilterSize))
                 {
