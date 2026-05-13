@@ -24,13 +24,15 @@ namespace LibUA
 
         public readonly string Target;
         public readonly int Port;
+        public readonly string Path;
+
         public readonly int Timeout;
 
         protected SLChannel config = null;
         private int MaximumMessageSize;
         private Semaphore cs = null;
         private Semaphore csDispatching = null;
-        private Semaphore csWaitForSecure = null;
+        private ManualResetEvent csWaitForSecure = null;
         private uint nextRequestHandle = 0;
 
         protected TcpClient tcp = null;
@@ -45,13 +47,23 @@ namespace LibUA
             public MemoryBuffer RecvBuf { get; set; }
             public NodeId Type { get; set; }
             public ResponseHeader Header { get; set; }
+
+            public void DisposeRecvBuf()
+            {
+                RecvBuf?.Dispose();
+                RecvBuf = null;
+            }
         }
 
         private Dictionary<Tuple<uint, uint>, RecvHandler> recvQueue = null;
         private Dictionary<Tuple<uint, uint>, ManualResetEvent> recvNotify = null;
-        private StatusCode recvHandlerStatus;
-        private bool nextPublish = false;
+        private volatile StatusCode recvHandlerStatus;
+        private volatile bool nextPublish = false;
         private HashSet<uint> publishReqs = null;
+        private readonly object syncLock = new object();
+        private readonly object recvQueueLock = new object();
+        private readonly object recvNotifyLock = new object();
+        private readonly object publishReqsLock = new object();
 
         public virtual X509Certificate2 ApplicationCertificate
         {
@@ -73,15 +85,38 @@ namespace LibUA
             get { return totalBytesRecv; }
         }
 
+        public uint? TokenLifetime
+        {
+            get { return config?.TokenLifetime; }
+        }
+
         public bool IsConnected
         {
-            get { return tcp != null && tcp.Connected; }
+            get
+            {
+                lock (syncLock)
+                {
+                    return tcp != null && tcp.Connected;
+                }
+            }
+        }
+
+        public bool CanReconnect
+        {
+            get { return !IsConnected && config?.AuthToken != null; }
         }
 
         public Client(string Target, int Port, int Timeout, int MaximumMessageSize = 1 << 18)
+            : this(Target, Port, null, Timeout, MaximumMessageSize)
+        {
+
+        }
+
+        public Client(string Target, int Port, string Path, int Timeout, int MaximumMessageSize = 1 << 18)
         {
             this.Target = Target;
             this.Port = Port;
+            this.Path = Path;
             this.Timeout = Timeout;
             this.MaximumMessageSize = MaximumMessageSize;
         }
@@ -94,7 +129,9 @@ namespace LibUA
 
             try
             {
+#pragma warning disable SYSLIB0057 // X509CertificateLoader unavailable on net462 target
                 config.RemoteCertificate = new X509Certificate2(serverCert);
+#pragma warning restore SYSLIB0057
             }
             catch
             {
@@ -107,333 +144,345 @@ namespace LibUA
             }
             finally
             {
-                csWaitForSecure.Release();
+                csWaitForSecure.Reset();
+                csWaitForSecure.Set();
             }
         }
 
-        private StatusCode RenewSecureChannel()
-        {
-            try
-            {
-                return OpenSecureChannelInternal(true);
-            }
-            finally
-            {
-                csWaitForSecure.Release();
-            }
-        }
-
-        private StatusCode OpenSecureChannelInternal(bool renew)
+        private StatusCode OpenSecureChannelInternal(bool renew, bool acquireSemaphore = true)
         {
             SecurityTokenRequestType requestType = renew ?
                 SecurityTokenRequestType.Renew : SecurityTokenRequestType.Issue;
+            RecvHandler recvHandler = null;
 
             try
             {
-                cs.WaitOne();
+                if (acquireSemaphore) { cs.WaitOne(); }
 
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-
-                if (requestType == SecurityTokenRequestType.Issue)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    config.ChannelID = 0;
-                }
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode((uint)(MessageType.Open) | ((uint)'F' << 24));
-                succeeded &= sendBuf.Encode((uint)0);
-                succeeded &= sendBuf.Encode(config.ChannelID);
-                succeeded &= sendBuf.EncodeUAString(Types.SLSecurityPolicyUris[(int)config.SecurityPolicy]);
-                if (config.SecurityPolicy == SecurityPolicy.None)
-                {
-                    succeeded &= sendBuf.EncodeUAByteString(null);
-                    succeeded &= sendBuf.EncodeUAByteString(null);
-                }
-                else
-                {
-                    var certStr = ApplicationCertificate.Export(X509ContentType.Cert);
-                    var serverCertThumbprint = UASecurity.SHACalculate(config.RemoteCertificateString, SecurityPolicy.Basic128Rsa15);
-
-                    succeeded &= sendBuf.EncodeUAByteString(certStr);
-                    succeeded &= sendBuf.EncodeUAByteString(serverCertThumbprint);
-                }
-
-                int asymCryptFrom = sendBuf.Position;
-
-                if (requestType == SecurityTokenRequestType.Issue)
-                {
-                    config.LocalSequence = new SLSequence()
+                    if (requestType == SecurityTokenRequestType.Issue)
                     {
-                        SequenceNumber = 51,
-                        RequestId = 1,
+                        config.ChannelID = 0;
+                    }
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode((uint)(MessageType.Open) | ((uint)'F' << 24));
+                    succeeded &= sendBuf.Encode((uint)0);
+                    succeeded &= sendBuf.Encode(config.ChannelID);
+                    succeeded &= sendBuf.EncodeUAString(Types.SLSecurityPolicyUris[(int)config.SecurityPolicy]);
+                    if (config.SecurityPolicy == SecurityPolicy.None)
+                    {
+                        succeeded &= sendBuf.EncodeUAByteString(null);
+                        succeeded &= sendBuf.EncodeUAByteString(null);
+                    }
+                    else
+                    {
+                        var certStr = ApplicationCertificate.Export(X509ContentType.Cert);
+                        var serverCertThumbprint = UASecurity.SHACalculate(config.RemoteCertificateString, SecurityPolicy.Basic128Rsa15);
+
+                        succeeded &= sendBuf.EncodeUAByteString(certStr);
+                        succeeded &= sendBuf.EncodeUAByteString(serverCertThumbprint);
+                    }
+
+                    int asymCryptFrom = sendBuf.Position;
+
+                    if (requestType == SecurityTokenRequestType.Issue)
+                    {
+                        config.LocalSequence = new SLSequence()
+                        {
+                            SequenceNumber = 51,
+                            RequestId = 1,
+                        };
+                    }
+
+                    succeeded &= sendBuf.Encode(config.LocalSequence.SequenceNumber);
+                    succeeded &= sendBuf.Encode(config.LocalSequence.RequestId);
+
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.OpenSecureChannelRequest));
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
                     };
-                }
 
-                succeeded &= sendBuf.Encode(config.LocalSequence.SequenceNumber);
-                succeeded &= sendBuf.Encode(config.LocalSequence.RequestId);
+                    UInt32 clientProtocolVersion = 0;
+                    UInt32 securityTokenRequestType = (uint)requestType;
+                    UInt32 messageSecurityMode = (uint)config.MessageSecurityMode;
+                    byte[] clientNonce = null;
+                    UInt32 reqLifetime = 300 * 1000;
 
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.OpenSecureChannelRequest));
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                UInt32 clientProtocolVersion = 0;
-                UInt32 securityTokenRequestType = (uint)requestType;
-                UInt32 messageSecurityMode = (uint)config.MessageSecurityMode;
-                byte[] clientNonce = null;
-                UInt32 reqLifetime = 30 * 10000;
-
-                if (config.SecurityPolicy != SecurityPolicy.None)
-                {
-                    int nonceSize = UASecurity.NonceLengthForSecurityPolicy(config.SecurityPolicy);
-                    clientNonce = UASecurity.GenerateRandomBytes(nonceSize);
-                }
-
-                succeeded &= sendBuf.Encode(reqHeader);
-                succeeded &= sendBuf.Encode(clientProtocolVersion);
-                succeeded &= sendBuf.Encode(securityTokenRequestType);
-                succeeded &= sendBuf.Encode(messageSecurityMode);
-                succeeded &= sendBuf.EncodeUAByteString(clientNonce);
-                succeeded &= sendBuf.Encode(reqLifetime);
-
-                config.LocalNonce = clientNonce;
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                if (config.SecurityPolicy == SecurityPolicy.None)
-                {
-                    MarkPositionAsSize(sendBuf);
-                }
-                else
-                {
-                    var padMethod = UASecurity.PaddingMethodForSecurityPolicy(config.SecurityPolicy);
-                    int sigSize = UASecurity.CalculateSignatureSize(ApplicationCertificate);
-                    int padSize = UASecurity.CalculatePaddingSize(config.RemoteCertificate, config.SecurityPolicy, sendBuf.Position - asymCryptFrom, sigSize);
-
-                    if (padSize > 0)
+                    if (config.SecurityPolicy != SecurityPolicy.None)
                     {
-                        byte paddingValue = (byte)((padSize - 1) & 0xFF);
-
-                        var appendPadding = new byte[padSize];
-                        for (int i = 0; i < padSize; i++) { appendPadding[i] = paddingValue; }
-                        sendBuf.Append(appendPadding);
+                        int nonceSize = UASecurity.NonceLengthForSecurityPolicy(config.SecurityPolicy);
+                        clientNonce = UASecurity.GenerateRandomBytes(nonceSize);
                     }
 
-                    int respSize = sendBuf.Position + sigSize;
+                    succeeded &= sendBuf.Encode(reqHeader);
+                    succeeded &= sendBuf.Encode(clientProtocolVersion);
+                    succeeded &= sendBuf.Encode(securityTokenRequestType);
+                    succeeded &= sendBuf.Encode(messageSecurityMode);
+                    succeeded &= sendBuf.EncodeUAByteString(clientNonce);
+                    succeeded &= sendBuf.Encode(reqLifetime);
 
-                    respSize = asymCryptFrom + UASecurity.CalculateEncryptedSize(config.RemoteCertificate, respSize - asymCryptFrom, padMethod);
-                    MarkPositionAsSize(sendBuf, (UInt32)respSize);
+                    config.LocalNonce = clientNonce;
 
-                    var msgSign = UASecurity.Sign(new ArraySegment<byte>(sendBuf.Buffer, 0, sendBuf.Position),
-                        ApplicationPrivateKey, config.SecurityPolicy);
-                    sendBuf.Append(msgSign);
-
-                    var packed = UASecurity.Encrypt(
-                        new ArraySegment<byte>(sendBuf.Buffer, asymCryptFrom, sendBuf.Position - asymCryptFrom),
-                        config.RemoteCertificate, UASecurity.UseOaepForSecurityPolicy(config.SecurityPolicy));
-
-                    sendBuf.Position = asymCryptFrom;
-                    sendBuf.Append(packed);
-
-                    if (sendBuf.Position != respSize)
+                    if (!succeeded)
                     {
-                        return StatusCode.BadSecurityChecksFailed;
-                    }
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Open, 0);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                tcp.Client.Send(sendBuf.Buffer, sendBuf.Position, SocketFlags.None);
-                Interlocked.Add(ref totalBytesSent, sendBuf.Position);
-
-                config.LocalSequence.SequenceNumber++;
-                uint reqId = config.LocalSequence.RequestId++;
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    var key = new Tuple<uint, uint>((uint)MessageType.Open, 0);
-                    if (!recvQueue.TryGetValue(key, out recvHandler))
-                    {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return StatusCode.BadEncodingLimitsExceeded;
                     }
 
-                    recvQueue.Remove(key);
-                }
-
-
-                if (!recvHandler.RecvBuf.Decode(out uint secureChannelId)) { return StatusCode.BadDecodingError; }
-
-                if (!recvHandler.RecvBuf.DecodeUAString(out string securityPolicyUri)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.DecodeUAByteString(out byte[] senderCertificate)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.DecodeUAByteString(out byte[] recvCertThumbprint)) { return StatusCode.BadDecodingError; }
-
-                try
-                {
-                    if (securityPolicyUri != Types.SLSecurityPolicyUris[(int)config.SecurityPolicy])
+                    if (config.SecurityPolicy == SecurityPolicy.None)
                     {
-                        return StatusCode.BadSecurityPolicyRejected;
+                        MarkPositionAsSize(sendBuf);
                     }
-                }
-                catch
-                {
-                    return StatusCode.BadSecurityPolicyRejected;
-                }
+                    else
+                    {
+                        var padMethod = UASecurity.PaddingMethodForSecurityPolicy(config.SecurityPolicy);
+                        int sigSize = UASecurity.CalculateSignatureSize(ApplicationCertificate);
 
-                // Check in the middle for buffer decrypt
-                if (config.SecurityPolicy != SecurityPolicy.None)
-                {
+                        if (config.RemoteCertificate.GetRSAPublicKey().KeySize <= 2048)
+                        {
+                            int padSize = UASecurity.CalculatePaddingSize(config.RemoteCertificate, config.SecurityPolicy, sendBuf.Position - asymCryptFrom + 1, sigSize);
+                            if (padSize > 0)
+                            {
+                                byte paddingValue = (byte)(padSize & 0xFF);
+
+                                var appendPadding = new byte[padSize + 1];
+                                for (int i = 0; i <= padSize; i++) { appendPadding[i] = paddingValue; }
+                                sendBuf.Append(appendPadding);
+                            }
+                        }
+                        else
+                        {
+                            int padSize = UASecurity.CalculatePaddingSize(config.RemoteCertificate, config.SecurityPolicy, sendBuf.Position - asymCryptFrom + 2, sigSize);
+                            if (padSize > 0)
+                            {
+                                byte paddingValue = (byte)(padSize & 0xFF);
+
+                                var appendPadding = new byte[padSize + 2];
+                                for (int i = 0; i <= padSize; i++) { appendPadding[i] = paddingValue; }
+                                appendPadding[padSize + 1] = (byte)(padSize >> 8);
+                                sendBuf.Append(appendPadding);
+                            }
+                        }
+
+                        int respSize = sendBuf.Position + sigSize;
+
+                        respSize = asymCryptFrom + UASecurity.CalculateEncryptedSize(config.RemoteCertificate, respSize - asymCryptFrom, padMethod);
+                        MarkPositionAsSize(sendBuf, (UInt32)respSize);
+
+                        var msgSign = UASecurity.Sign(new ArraySegment<byte>(sendBuf.Buffer, 0, sendBuf.Position),
+                            ApplicationPrivateKey, config.SecurityPolicy);
+                        sendBuf.Append(msgSign);
+
+                        var packed = UASecurity.Encrypt(
+                            new ArraySegment<byte>(sendBuf.Buffer, asymCryptFrom, sendBuf.Position - asymCryptFrom),
+                            config.RemoteCertificate, UASecurity.UseOaepForSecurityPolicy(config.SecurityPolicy));
+
+                        sendBuf.Position = asymCryptFrom;
+                        sendBuf.Append(packed);
+
+                        if (sendBuf.Position != respSize)
+                        {
+                            return StatusCode.BadSecurityChecksFailed;
+                        }
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Open, 0);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    tcp.Client.Send(sendBuf.Buffer, sendBuf.Position, SocketFlags.None);
+                    Interlocked.Add(ref totalBytesSent, sendBuf.Position);
+
+
+                    config.LocalSequence.SequenceNumber++;
+                    uint reqId = config.LocalSequence.RequestId++;
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        var key = new Tuple<uint, uint>((uint)MessageType.Open, 0);
+                        if (!recvQueue.TryGetValue(key, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(key);
+                    }
+
+                    if (!recvHandler.RecvBuf.Decode(out uint secureChannelId)) { return StatusCode.BadDecodingError; }
+
+                    if (!recvHandler.RecvBuf.DecodeUAString(out string securityPolicyUri)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.DecodeUAByteString(out byte[] senderCertificate)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.DecodeUAByteString(out byte[] recvCertThumbprint)) { return StatusCode.BadDecodingError; }
+
                     try
                     {
-
-                        config.RemoteCertificate = new X509Certificate2(senderCertificate);
-                        if (!UASecurity.VerifyCertificate(config.RemoteCertificate))
+                        if (securityPolicyUri != Types.SLSecurityPolicyUris[(int)config.SecurityPolicy])
                         {
-                            return StatusCode.BadCertificateInvalid;
+                            return StatusCode.BadSecurityPolicyRejected;
                         }
                     }
                     catch
                     {
-                        return StatusCode.BadCertificateInvalid;
+                        return StatusCode.BadSecurityPolicyRejected;
                     }
 
-                    var appCertStr = ApplicationCertificate.Export(X509ContentType.Cert);
-                    if (!UASecurity.SHAVerify(appCertStr, recvCertThumbprint, SecurityPolicy.Basic128Rsa15))
+                    // Check in the middle for buffer decrypt
+                    if (config.SecurityPolicy != SecurityPolicy.None)
                     {
-                        return StatusCode.BadSecurityChecksFailed;
+                        try
+                        {
+
+#pragma warning disable SYSLIB0057 // X509CertificateLoader unavailable on net462 target
+                            config.RemoteCertificate = new X509Certificate2(senderCertificate);
+#pragma warning restore SYSLIB0057
+                            if (!UASecurity.VerifyCertificate(config.RemoteCertificate))
+                            {
+                                return StatusCode.BadCertificateInvalid;
+                            }
+                        }
+                        catch
+                        {
+                            return StatusCode.BadCertificateInvalid;
+                        }
+
+                        var appCertStr = ApplicationCertificate.Export(X509ContentType.Cert);
+                        if (!UASecurity.SHAVerify(appCertStr, recvCertThumbprint, SecurityPolicy.Basic128Rsa15))
+                        {
+                            return StatusCode.BadSecurityChecksFailed;
+                        }
+
+                        var asymDecBuf = UASecurity.Decrypt(
+                            new ArraySegment<byte>(recvHandler.RecvBuf.Buffer, recvHandler.RecvBuf.Position, recvHandler.RecvBuf.Capacity - recvHandler.RecvBuf.Position),
+                            ApplicationCertificate, ApplicationPrivateKey, UASecurity.UseOaepForSecurityPolicy(config.SecurityPolicy));
+
+                        int minPlainSize = Math.Min(asymDecBuf.Length, recvHandler.RecvBuf.Capacity - recvHandler.RecvBuf.Position);
+                        Array.Copy(asymDecBuf, 0, recvHandler.RecvBuf.Buffer, recvHandler.RecvBuf.Position, minPlainSize);
                     }
 
-                    var asymDecBuf = UASecurity.Decrypt(
-                        new ArraySegment<byte>(recvHandler.RecvBuf.Buffer, recvHandler.RecvBuf.Position, recvHandler.RecvBuf.Capacity - recvHandler.RecvBuf.Position),
-                        ApplicationCertificate, ApplicationPrivateKey, UASecurity.UseOaepForSecurityPolicy(config.SecurityPolicy));
+                    if (!recvHandler.RecvBuf.Decode(out uint respSequenceNumber)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out uint respRequestId)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out NodeId messageType)) { return StatusCode.BadDecodingError; }
 
-                    int minPlainSize = Math.Min(asymDecBuf.Length, recvHandler.RecvBuf.Capacity - recvHandler.RecvBuf.Position);
-                    Array.Copy(asymDecBuf, 0, recvHandler.RecvBuf.Buffer, recvHandler.RecvBuf.Position, minPlainSize);
-                }
-
-                if (!recvHandler.RecvBuf.Decode(out uint respSequenceNumber)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.Decode(out uint respRequestId)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.Decode(out NodeId messageType)) { return StatusCode.BadDecodingError; }
-
-                if (!messageType.EqualsNumeric(0, (uint)RequestCode.OpenSecureChannelResponse))
-                {
-                    return StatusCode.BadSecureChannelClosed;
-                }
-
-                if (!renew)
-                {
-                    config.RemoteSequence = new SLSequence()
+                    if (!messageType.EqualsNumeric(0, (uint)RequestCode.OpenSecureChannelResponse))
                     {
-                        RequestId = respRequestId,
-                        SequenceNumber = respSequenceNumber
-                    };
-                }
+                        return StatusCode.BadSecureChannelClosed;
+                    }
 
-                if (!recvHandler.RecvBuf.Decode(out ResponseHeader _)) { return StatusCode.BadDecodingError; }
-
-                if (!recvHandler.RecvBuf.Decode(out uint _)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.Decode(out uint channelId)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.Decode(out uint tokenId)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.Decode(out ulong createAtTimestamp)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.Decode(out uint respLifetime)) { return StatusCode.BadDecodingError; }
-                if (!recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce)) { return StatusCode.BadDecodingError; }
-
-                if (renew)
-                {
-                    config.PrevChannelID = config.ChannelID;
-                    config.PrevTokenID = config.TokenID;
-                }
-
-                config.ChannelID = channelId;
-                config.TokenID = tokenId;
-                config.TokenCreatedAt = DateTimeOffset.FromFileTime((long)createAtTimestamp);
-                config.TokenLifetime = respLifetime;
-                config.RemoteNonce = serverNonce;
-
-                if (config.SecurityPolicy == SecurityPolicy.None)
-                {
-                    config.LocalKeysets = new SLChannel.Keyset[2] { new SLChannel.Keyset(), new SLChannel.Keyset() };
-                    config.RemoteKeysets = new SLChannel.Keyset[2] { new SLChannel.Keyset(), new SLChannel.Keyset() };
-                }
-                else
-                {
-                    int symKeySize = UASecurity.SymmetricKeySizeForSecurityPolicy(config.SecurityPolicy);
-
-                    int sigKeySize = UASecurity.SymmetricSignatureKeySizeForSecurityPolicy(config.SecurityPolicy);
-                    int symBlockSize = UASecurity.SymmetricBlockSizeForSecurityPolicy();
-
-                    var clientHash = UASecurity.PSHA(
-                        config.RemoteNonce,
-                        config.LocalNonce,
-                        sigKeySize + symKeySize + symBlockSize, config.SecurityPolicy);
-
-                    var newLocalKeyset = new SLChannel.Keyset(
-                        (new ArraySegment<byte>(clientHash, 0, sigKeySize)).ToArray(),
-                        (new ArraySegment<byte>(clientHash, sigKeySize, symKeySize)).ToArray(),
-                        (new ArraySegment<byte>(clientHash, sigKeySize + symKeySize, symBlockSize)).ToArray());
-
-                    var serverHash = UASecurity.PSHA(
-                        config.LocalNonce,
-                        config.RemoteNonce,
-                        sigKeySize + symKeySize + symBlockSize, config.SecurityPolicy);
-
-                    var newRemoteKeyset = new SLChannel.Keyset(
-                        (new ArraySegment<byte>(serverHash, 0, sigKeySize)).ToArray(),
-                        (new ArraySegment<byte>(serverHash, sigKeySize, symKeySize)).ToArray(),
-                        (new ArraySegment<byte>(serverHash, sigKeySize + symKeySize, symBlockSize)).ToArray());
-
-                    //Console.WriteLine("Local nonce: {0}", string.Join("", config.LocalNonce.Select(v => v.ToString("X2"))));
-                    //Console.WriteLine("Remote nonce: {0}", string.Join("", config.RemoteNonce.Select(v => v.ToString("X2"))));
-
-                    //Console.WriteLine("RSymSignKey: {0}", string.Join("", newRemoteKeyset.SymSignKey.Select(v => v.ToString("X2"))));
-                    //Console.WriteLine("RSymEncKey: {0}", string.Join("", newRemoteKeyset.SymEncKey.Select(v => v.ToString("X2"))));
-                    //Console.WriteLine("RSymIV: {0}", string.Join("", newRemoteKeyset.SymIV.Select(v => v.ToString("X2"))));
-
-                    //Console.WriteLine("LSymSignKey: {0}", string.Join("", newLocalKeyset.SymSignKey.Select(v => v.ToString("X2"))));
-                    //Console.WriteLine("LSymEncKey: {0}", string.Join("", newLocalKeyset.SymEncKey.Select(v => v.ToString("X2"))));
-                    //Console.WriteLine("LSymIV: {0}", string.Join("", newLocalKeyset.SymIV.Select(v => v.ToString("X2"))));
-
-                    if (config.LocalKeysets == null)
+                    if (!renew)
                     {
-                        config.LocalKeysets = new SLChannel.Keyset[2] { newLocalKeyset, new SLChannel.Keyset() };
-                        config.RemoteKeysets = new SLChannel.Keyset[2] { newRemoteKeyset, new SLChannel.Keyset() };
+                        config.RemoteSequence = new SLSequence()
+                        {
+                            RequestId = respRequestId,
+                            SequenceNumber = respSequenceNumber
+                        };
+                    }
+
+                    if (!recvHandler.RecvBuf.Decode(out ResponseHeader _)) { return StatusCode.BadDecodingError; }
+
+                    if (!recvHandler.RecvBuf.Decode(out uint _)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out uint channelId)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out uint tokenId)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out ulong createAtTimestamp)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out uint respLifetime)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce)) { return StatusCode.BadDecodingError; }
+
+                    if (renew)
+                    {
+                        config.PrevChannelID = config.ChannelID;
+                        config.PrevTokenID = config.TokenID;
+                    }
+
+                    config.ChannelID = channelId;
+                    config.TokenID = tokenId;
+                    config.TokenCreatedAt = DateTimeOffset.FromFileTime((long)createAtTimestamp);
+                    if (config.TokenLifetime == 0)
+                    {
+                        config.TokenLifetime = respLifetime;
+                    }
+                    config.RemoteNonce = serverNonce;
+
+                    if (config.SecurityPolicy == SecurityPolicy.None)
+                    {
+                        config.LocalKeysets = new SLChannel.Keyset[2] { new SLChannel.Keyset(), new SLChannel.Keyset() };
+                        config.RemoteKeysets = new SLChannel.Keyset[2] { new SLChannel.Keyset(), new SLChannel.Keyset() };
                     }
                     else
                     {
-                        config.LocalKeysets = new SLChannel.Keyset[2] { newLocalKeyset, config.LocalKeysets[0] };
-                        config.RemoteKeysets = new SLChannel.Keyset[2] { newRemoteKeyset, config.RemoteKeysets[0] };
-                    }
-                }
+                        int symKeySize = UASecurity.SymmetricKeySizeForSecurityPolicy(config.SecurityPolicy);
 
-                return StatusCode.Good;
+                        int sigKeySize = UASecurity.SymmetricSignatureKeySizeForSecurityPolicy(config.SecurityPolicy);
+                        int symBlockSize = UASecurity.SymmetricBlockSizeForSecurityPolicy(config.SecurityPolicy);
+
+                        var clientHash = UASecurity.PSHA(
+                            config.RemoteNonce,
+                            config.LocalNonce,
+                            sigKeySize + symKeySize + symBlockSize, config.SecurityPolicy);
+
+                        var newLocalKeyset = new SLChannel.Keyset(
+                            (new ArraySegment<byte>(clientHash, 0, sigKeySize)).ToArray(),
+                            (new ArraySegment<byte>(clientHash, sigKeySize, symKeySize)).ToArray(),
+                            (new ArraySegment<byte>(clientHash, sigKeySize + symKeySize, symBlockSize)).ToArray());
+
+                        var serverHash = UASecurity.PSHA(
+                            config.LocalNonce,
+                            config.RemoteNonce,
+                            sigKeySize + symKeySize + symBlockSize, config.SecurityPolicy);
+
+                        var newRemoteKeyset = new SLChannel.Keyset(
+                            (new ArraySegment<byte>(serverHash, 0, sigKeySize)).ToArray(),
+                            (new ArraySegment<byte>(serverHash, sigKeySize, symKeySize)).ToArray(),
+                            (new ArraySegment<byte>(serverHash, sigKeySize + symKeySize, symBlockSize)).ToArray());
+
+                        //Console.WriteLine("Local nonce: {0}", string.Join("", config.LocalNonce.Select(v => v.ToString("X2"))));
+                        //Console.WriteLine("Remote nonce: {0}", string.Join("", config.RemoteNonce.Select(v => v.ToString("X2"))));
+
+                        //Console.WriteLine("RSymSignKey: {0}", string.Join("", newRemoteKeyset.SymSignKey.Select(v => v.ToString("X2"))));
+                        //Console.WriteLine("RSymEncKey: {0}", string.Join("", newRemoteKeyset.SymEncKey.Select(v => v.ToString("X2"))));
+                        //Console.WriteLine("RSymIV: {0}", string.Join("", newRemoteKeyset.SymIV.Select(v => v.ToString("X2"))));
+
+                        //Console.WriteLine("LSymSignKey: {0}", string.Join("", newLocalKeyset.SymSignKey.Select(v => v.ToString("X2"))));
+                        //Console.WriteLine("LSymEncKey: {0}", string.Join("", newLocalKeyset.SymEncKey.Select(v => v.ToString("X2"))));
+                        //Console.WriteLine("LSymIV: {0}", string.Join("", newLocalKeyset.SymIV.Select(v => v.ToString("X2"))));
+
+                        if (config.LocalKeysets == null)
+                        {
+                            config.LocalKeysets = new SLChannel.Keyset[2] { newLocalKeyset, new SLChannel.Keyset() };
+                            config.RemoteKeysets = new SLChannel.Keyset[2] { newRemoteKeyset, new SLChannel.Keyset() };
+                        }
+                        else
+                        {
+                            config.LocalKeysets = new SLChannel.Keyset[2] { newLocalKeyset, config.LocalKeysets[0] };
+                            config.RemoteKeysets = new SLChannel.Keyset[2] { newRemoteKeyset, config.RemoteKeysets[0] };
+                        }
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
-                cs.Release();
+                recvHandler?.DisposeRecvBuf();
+                if (acquireSemaphore) { cs.Release(); }
 
                 if (!renew)
                 {
@@ -442,7 +491,59 @@ namespace LibUA
             }
         }
 
-        private StatusCode EncodeMessageHeader(MemoryBuffer sendBuf, bool needsEstablishedSL = true)
+        public StatusCode CloseSecureChannel()
+        {
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false, MessageType.Close);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = new NodeId((uint)0),
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.CloseSecureChannelRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        private StatusCode EncodeMessageHeader(MemoryBuffer sendBuf, bool needsEstablishedSL = true, MessageType messageType = MessageType.Message)
         {
             if (config.SLState != ConnectionState.Established && needsEstablishedSL)
             {
@@ -450,7 +551,7 @@ namespace LibUA
             }
 
             bool succeeded = true;
-            succeeded &= sendBuf.Encode((uint)(MessageType.Message) | ((uint)'F' << 24));
+            succeeded &= sendBuf.Encode((uint)(messageType) | ((uint)'F' << 24));
             succeeded &= sendBuf.Encode((uint)0);
             succeeded &= sendBuf.Encode(config.ChannelID);
             succeeded &= sendBuf.Encode(config.TokenID);
@@ -471,97 +572,100 @@ namespace LibUA
         public StatusCode GetEndpoints(out EndpointDescription[] endpointDescs, string[] localeIDs)
         {
             endpointDescs = null;
+            RecvHandler recvHandler = null;
 
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.GetEndpointsRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.EncodeUAString(string.Format("opc.tcp://{0}:{1}", config.Endpoint.Address.ToString(), config.Endpoint.Port.ToString()));
-                // LocaleIds
-                succeeded &= sendBuf.EncodeUAString(localeIDs);
-                // ProfileUris
-                succeeded &= sendBuf.Encode((UInt32)0);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.GetEndpointsRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.EncodeUAString(GetEndpointString());
+                    // LocaleIds
+                    succeeded &= sendBuf.EncodeUAString(localeIDs);
+                    // ProfileUris
+                    succeeded &= sendBuf.Encode((UInt32)0);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.GetEndpointsResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numEndpointDescs);
+
+                    endpointDescs = new EndpointDescription[numEndpointDescs];
+                    for (int i = 0; i < numEndpointDescs && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out endpointDescs[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.GetEndpointsResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numEndpointDescs);
-
-                endpointDescs = new EndpointDescription[numEndpointDescs];
-                for (int i = 0; i < numEndpointDescs && succeeded; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out endpointDescs[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -570,97 +674,100 @@ namespace LibUA
         public StatusCode FindServers(out ApplicationDescription[] results, string[] localeIDs)
         {
             results = null;
+            RecvHandler recvHandler = null;
 
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.FindServersRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.EncodeUAString(string.Format("opc.tcp://{0}:{1}", config.Endpoint.Address.ToString(), config.Endpoint.Port.ToString()));
-                // LocaleIds
-                succeeded &= sendBuf.EncodeUAString(localeIDs);
-                // ProfileIds
-                succeeded &= sendBuf.Encode((UInt32)0);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.FindServersRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.EncodeUAString(GetEndpointString());
+                    // LocaleIds
+                    succeeded &= sendBuf.EncodeUAString(localeIDs);
+                    // ProfileIds
+                    succeeded &= sendBuf.Encode((UInt32)0);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.FindServersResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDescs);
+
+                    results = new ApplicationDescription[numDescs];
+                    for (int i = 0; i < numDescs && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.FindServersResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDescs);
-
-                results = new ApplicationDescription[numDescs];
-                for (int i = 0; i < numDescs && succeeded; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -674,7 +781,16 @@ namespace LibUA
 
             int chunkSize = (int)config.TL.TransportConfig.RecvBufferSize - ChunkHeaderOverhead - TLPaddingOverhead;
             //int chunkSize = 2048 - ChunkHeaderOverhead - TLPaddingOverhead;
-            int numChunks = (respBuf.Position - ChunkHeaderOverhead + chunkSize - 1) / chunkSize;
+            if (chunkSize <= 0)
+            {
+                return StatusCode.BadEncodingLimitsExceeded;
+            }
+            long numChunksLong = ((long)respBuf.Position - ChunkHeaderOverhead + chunkSize - 1) / chunkSize;
+            if (numChunksLong > int.MaxValue)
+            {
+                return StatusCode.BadEncodingLimitsExceeded;
+            }
+            int numChunks = (int)numChunksLong;
 
             if (numChunks > 1 && config.TL.TransportConfig.MaxChunkCount > 0 &&
                 numChunks > config.TL.TransportConfig.MaxChunkCount)
@@ -685,43 +801,45 @@ namespace LibUA
             if (numChunks > 1)
             {
                 //Console.WriteLine("{0} -> {1} chunks", respBuf.Position, numChunks);
-                var chunk = new MemoryBuffer(chunkSize + ChunkHeaderOverhead + TLPaddingOverhead);
-                for (int i = 0; i < numChunks; i++)
+                using (var chunk = new MemoryBuffer(chunkSize + ChunkHeaderOverhead + TLPaddingOverhead))
                 {
-                    bool isFinal = i == numChunks - 1;
-
-                    chunk.Rewind();
-                    int offset = i * chunkSize;
-                    int curSize = isFinal ?
-                        respBuf.Position - ChunkHeaderOverhead - offset :
-                        chunkSize;
-
-                    chunk.Append(respBuf.Buffer, 0, ChunkHeaderOverhead);
-                    if (i > 0)
+                    for (int i = 0; i < numChunks; i++)
                     {
-                        chunk.Encode(config.LocalSequence.SequenceNumber, seqPosition);
-                        config.LocalSequence.SequenceNumber++;
-                    }
+                        bool isFinal = i == numChunks - 1;
 
-                    chunk.Buffer[3] = isFinal ? (byte)'F' : (byte)'C';
-                    chunk.Append(respBuf.Buffer, ChunkHeaderOverhead + offset, curSize);
+                        chunk.Rewind();
+                        int offset = i * chunkSize;
+                        int curSize = isFinal ?
+                            respBuf.Position - ChunkHeaderOverhead - offset :
+                            chunkSize;
 
-                    if (config.MessageSecurityMode == MessageSecurityMode.None)
-                    {
-                        MarkPositionAsSize(chunk);
-                    }
-                    else
-                    {
-                        var secureRes = UASecurity.SecureSymmetric(chunk, MessageEncodedBlockStart, config.LocalKeysets[0], config.RemoteKeysets[0], config.SecurityPolicy, config.MessageSecurityMode);
-
-                        if (!Types.StatusCodeIsGood((uint)secureRes))
+                        chunk.Append(respBuf.Buffer, 0, ChunkHeaderOverhead);
+                        if (i > 0)
                         {
-                            return secureRes;
+                            chunk.Encode(config.LocalSequence.SequenceNumber, seqPosition);
+                            config.LocalSequence.SequenceNumber++;
                         }
-                    }
 
-                    tcp.Client.Send(chunk.Buffer, chunk.Position, SocketFlags.None);
-                    Interlocked.Add(ref totalBytesSent, chunk.Position);
+                        chunk.Buffer[3] = isFinal ? (byte)'F' : (byte)'C';
+                        chunk.Append(respBuf.Buffer, ChunkHeaderOverhead + offset, curSize);
+
+                        if (config.MessageSecurityMode == MessageSecurityMode.None)
+                        {
+                            MarkPositionAsSize(chunk);
+                        }
+                        else
+                        {
+                            var secureRes = UASecurity.SecureSymmetric(chunk, MessageEncodedBlockStart, config.LocalKeysets[0], config.RemoteKeysets[0], config.SecurityPolicy, config.MessageSecurityMode);
+
+                            if (!Types.StatusCodeIsGood((uint)secureRes))
+                            {
+                                return secureRes;
+                            }
+                        }
+
+                        tcp.Client.Send(chunk.Buffer, chunk.Position, SocketFlags.None);
+                        Interlocked.Add(ref totalBytesSent, chunk.Position);
+                    }
                 }
             }
             else
@@ -754,6 +872,11 @@ namespace LibUA
 
         public StatusCode Connect()
         {
+            return Connect(false);
+        }
+
+        public StatusCode Connect(bool reuseSession)
+        {
             if (IsConnected)
             {
                 throw new Exception("Disconnect before connecting again.");
@@ -770,7 +893,19 @@ namespace LibUA
 
                 try
                 {
-                    tcp = new TcpClient(Target, Port);
+                    tcp = new TcpClient();
+                    var ar = tcp.BeginConnect(Target, Port, null, null);
+
+                    // Wait for completion or timeout
+                    var success = ar.AsyncWaitHandle.WaitOne(Timeout * 1000);
+                    if (!success)
+                    {
+                        tcp.Close();
+                        throw new SocketException();
+                    }
+
+                    // Ensure connection is completed
+                    tcp.EndConnect(ar);
                 }
                 catch (SocketException)
                 {
@@ -778,18 +913,29 @@ namespace LibUA
                 }
 
                 csDispatching = new Semaphore(1, 1);
-                csWaitForSecure = new Semaphore(0, 1);
+                csWaitForSecure = new ManualResetEvent(false);
 
                 nextRequestHandle = 0;
 
                 tcp.NoDelay = true;
                 tcp.Client.NoDelay = true;
+                tcp.ReceiveTimeout = Timeout * 1000;
+                tcp.SendTimeout = Timeout * 1000;
 
-                config = new SLChannel
+                // If session should be reused, and we have an AuthToken, reuse the config:
+                if (reuseSession && config?.AuthToken != null)
                 {
-                    Endpoint = tcp.Client.RemoteEndPoint as IPEndPoint,
-                    SLState = ConnectionState.Opening
-                };
+                    config.Endpoint = tcp.Client.RemoteEndPoint as IPEndPoint;
+                    config.SLState = ConnectionState.Opening;
+                }
+                else
+                {
+                    config = new SLChannel
+                    {
+                        Endpoint = tcp.Client.RemoteEndPoint as IPEndPoint,
+                        SLState = ConnectionState.Opening
+                    };
+                }
 
                 recvQueue = new Dictionary<Tuple<uint, uint>, RecvHandler>();
                 recvNotify = new Dictionary<Tuple<uint, uint>, ManualResetEvent>();
@@ -817,100 +963,123 @@ namespace LibUA
 
         private StatusCode SendHello()
         {
-            var sendBuf = new MemoryBuffer(MaximumMessageSize);
-
-            config.TL = new TLConnection
+            using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
             {
-                TransportConfig = new TLConfiguration()
+                config.TL = new TLConnection
                 {
-                    ProtocolVersion = 0,
-                    SendBufferSize = 1 << 16,
-                    RecvBufferSize = 1 << 16,
-                    MaxMessageSize = (uint)MaximumMessageSize,
-                    MaxChunkCount = 1337 + (uint)(MaximumMessageSize + ((1 << 16) - 1)) / (1 << 16),
-                }
-            };
+                    TransportConfig = new TLConfiguration()
+                    {
+                        ProtocolVersion = 0,
+                        SendBufferSize = 1 << 16,
+                        RecvBufferSize = 1 << 16,
+                        MaxMessageSize = (uint)MaximumMessageSize,
+                        MaxChunkCount = 1337 + (uint)(MaximumMessageSize + ((1 << 16) - 1)) / (1 << 16),
+                    }
+                };
 
-            bool succeeded = true;
-            succeeded &= sendBuf.Encode((uint)(MessageType.Hello) | ((uint)'F' << 24));
-            succeeded &= sendBuf.Encode((uint)0);
-            succeeded &= sendBuf.Encode(config.TL.TransportConfig.ProtocolVersion);
-            succeeded &= sendBuf.Encode(config.TL.TransportConfig.RecvBufferSize);
-            succeeded &= sendBuf.Encode(config.TL.TransportConfig.SendBufferSize);
-            succeeded &= sendBuf.Encode(config.TL.TransportConfig.MaxMessageSize);
-            succeeded &= sendBuf.Encode(config.TL.TransportConfig.MaxChunkCount);
-            succeeded &= sendBuf.EncodeUAString(string.Format("opc.tcp://{0}:{1}", config.Endpoint.Address.ToString(), config.Endpoint.Port.ToString()));
+                bool succeeded = true;
+                succeeded &= sendBuf.Encode((uint)(MessageType.Hello) | ((uint)'F' << 24));
+                succeeded &= sendBuf.Encode((uint)0);
+                succeeded &= sendBuf.Encode(config.TL.TransportConfig.ProtocolVersion);
+                succeeded &= sendBuf.Encode(config.TL.TransportConfig.RecvBufferSize);
+                succeeded &= sendBuf.Encode(config.TL.TransportConfig.SendBufferSize);
+                succeeded &= sendBuf.Encode(config.TL.TransportConfig.MaxMessageSize);
+                succeeded &= sendBuf.Encode(config.TL.TransportConfig.MaxChunkCount);
+                succeeded &= sendBuf.EncodeUAString(GetEndpointString());
 
-            if (!succeeded)
-            {
-                return StatusCode.BadEncodingLimitsExceeded;
-            }
-
-            MarkPositionAsSize(sendBuf);
-
-            var recvKey = new Tuple<uint, uint>((uint)MessageType.Acknowledge, 0);
-            var recvEv = new ManualResetEvent(false);
-            lock (recvNotify)
-            {
-                recvNotify[recvKey] = recvEv;
-            }
-
-            tcp.Client.Send(sendBuf.Buffer, sendBuf.Position, SocketFlags.None);
-            Interlocked.Add(ref totalBytesSent, sendBuf.Position);
-
-            bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-            lock (recvNotify)
-            {
-                recvNotify.Remove(recvKey);
-            }
-
-            if (recvHandlerStatus != StatusCode.Good)
-            {
-                return recvHandlerStatus;
-            }
-
-            if (!signalled)
-            {
-                return StatusCode.BadRequestTimeout;
-            }
-
-            RecvHandler recvHandler;
-            lock (recvQueue)
-            {
-                var key = new Tuple<uint, uint>((uint)MessageType.Acknowledge, 0);
-                if (!recvQueue.TryGetValue(key, out recvHandler))
+                if (!succeeded)
                 {
-                    return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    return StatusCode.BadEncodingLimitsExceeded;
                 }
 
-                recvQueue.Remove(key);
+                MarkPositionAsSize(sendBuf);
+
+                var recvKey = new Tuple<uint, uint>((uint)MessageType.Acknowledge, 0);
+                var recvEv = new ManualResetEvent(false);
+                lock (recvNotifyLock)
+                {
+                    recvNotify[recvKey] = recvEv;
+                }
+
+                tcp.Client.Send(sendBuf.Buffer, sendBuf.Position, SocketFlags.None);
+                Interlocked.Add(ref totalBytesSent, sendBuf.Position);
+
+                bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                lock (recvNotifyLock)
+                {
+                    recvNotify.Remove(recvKey);
+                }
+
+                if (recvHandlerStatus != StatusCode.Good)
+                {
+                    return recvHandlerStatus;
+                }
+
+                if (!signalled)
+                {
+                    return StatusCode.BadRequestTimeout;
+                }
+
+                RecvHandler recvHandler = null;
+                lock (recvQueueLock)
+                {
+                    var key = new Tuple<uint, uint>((uint)MessageType.Acknowledge, 0);
+                    if (!recvQueue.TryGetValue(key, out recvHandler))
+                    {
+                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                    }
+
+                    recvQueue.Remove(key);
+                }
+
+                try
+                {
+                    config.TL.TransportConfig = new TLConfiguration();
+                    if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.ProtocolVersion)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.RecvBufferSize)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.SendBufferSize)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.MaxMessageSize)) { return StatusCode.BadDecodingError; }
+                    if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.MaxChunkCount)) { return StatusCode.BadDecodingError; }
+
+                    MaximumMessageSize = (int)Math.Min(config.TL.TransportConfig.MaxMessageSize, MaximumMessageSize);
+
+                    //if (!signalled)
+                    //{
+                    //	RemovePendingRequest(RequestId);
+
+                    //	// Clear if received between Wait and Remove
+                    //	if (semRecvMsg.WaitOne(0))
+                    //	{
+                    //		// Clean up message
+                    //		RemovePendingRequest(RequestId);
+                    //	}
+
+                    //	return DXPStatusCode.BadNoResponse;
+                    //}
+
+                    return StatusCode.Good;
+                }
+                finally
+                {
+                    recvHandler?.DisposeRecvBuf();
+                }
+            }
+        }
+
+        private string GetEndpointString()
+        {
+            string endpointString;
+            if (string.IsNullOrWhiteSpace(Path))
+            {
+                endpointString = string.Format("opc.tcp://{0}:{1}", Target, config.Endpoint.Port.ToString());
+            }
+            else
+            {
+                endpointString = string.Format("opc.tcp://{0}:{1}/{2}", Target, config.Endpoint.Port.ToString(), Path);
             }
 
-            config.TL.TransportConfig = new TLConfiguration();
-            if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.ProtocolVersion)) { return StatusCode.BadDecodingError; }
-            if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.RecvBufferSize)) { return StatusCode.BadDecodingError; }
-            if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.SendBufferSize)) { return StatusCode.BadDecodingError; }
-            if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.MaxMessageSize)) { return StatusCode.BadDecodingError; }
-            if (!recvHandler.RecvBuf.Decode(out config.TL.TransportConfig.MaxChunkCount)) { return StatusCode.BadDecodingError; }
-
-            MaximumMessageSize = (int)Math.Min(config.TL.TransportConfig.MaxMessageSize, MaximumMessageSize);
-
-            //if (!signalled)
-            //{
-            //	RemovePendingRequest(RequestId);
-
-            //	// Clear if received between Wait and Remove
-            //	if (semRecvMsg.WaitOne(0))
-            //	{
-            //		// Clean up message
-            //		RemovePendingRequest(RequestId);
-            //	}
-
-            //	return DXPStatusCode.BadNoResponse;
-            //}
-
-            return StatusCode.Good;
+            return endpointString;
         }
 
         protected void MarkPositionAsSize(MemoryBuffer mb, UInt32 position)
@@ -939,53 +1108,61 @@ namespace LibUA
         {
             nextPublish = false;
 
-            if (renewTimer != null)
+            System.Timers.Timer timerToStop = null;
+            lock (syncLock)
             {
-                try
+                if (renewTimer != null)
                 {
-                    cs.WaitOne();
-                    renewTimer.Stop();
+                    timerToStop = renewTimer;
+                    renewTimer = null;
                 }
-                finally
-                {
-                    cs.Release();
-                }
+            }
 
-                renewTimer = null;
+            if (timerToStop != null)
+            {
+                timerToStop.Stop();
             }
 
             if (thread != null)
             {
+                if (config.SessionIdToken != null)
+                {
+                    CloseSession();
+                }
+                if (config.ChannelID > 0)
+                {
+                    CloseSecureChannel();
+                }
+
                 threadAbort = true;
+                CloseConnection();
 
                 thread.Join();
                 thread = null;
             }
 
-            if (tcp == null)
-            {
-                return StatusCode.BadNotConnected;
-            }
-
-            CloseConnection();
             return StatusCode.Good;
         }
 
         private void CloseConnection()
         {
+            var tcpCopy = Interlocked.Exchange(ref tcp, null);
+            if (tcpCopy == null)
+            {
+                return;
+            }
+
+            System.Diagnostics.Debug.WriteLine("[Client] CloseConnection called, threadAbort=" + threadAbort + ", stack: " + Environment.StackTrace);
+
             try
             {
-                if (tcp != null)
-                {
-                    tcp.Client.Shutdown(SocketShutdown.Both);
-                    tcp.Close();
-
-                    OnConnectionClosed?.Invoke();
-                }
+                tcpCopy.Client.Shutdown(SocketShutdown.Both);
+                tcpCopy.Close();
+                OnConnectionClosed?.Invoke();
             }
-            finally
+            catch (SocketException)
             {
-                tcp = null;
+                // Disconnected
             }
         }
 
@@ -1012,10 +1189,19 @@ namespace LibUA
 
                 var checkRead = new List<Socket> { socket };
                 var checkError = new List<Socket> { socket };
-                Socket.Select(checkRead, null, checkError, ListenerInterval * 1000);
+                try
+                {
+                    Socket.Select(checkRead, null, checkError, ListenerInterval * 1000);
+                }
+                catch (SocketException)
+                {
+                    System.Diagnostics.Debug.WriteLine("[Client] Socket.Select threw SocketException, breaking receive loop");
+                    break;
+                }
 
                 if (checkError.Count > 0)
                 {
+                    System.Diagnostics.Debug.WriteLine("[Client] Socket.Select reported error, breaking receive loop");
                     break;
                 }
 
@@ -1035,11 +1221,13 @@ namespace LibUA
                     }
                     catch
                     {
+                        System.Diagnostics.Debug.WriteLine("[Client] Receive exception, breaking receive loop");
                         break;
                     }
 
                     if (bytesRead == 0)
                     {
+                        System.Diagnostics.Debug.WriteLine("[Client] Socket.Receive returned 0 (server closed), breaking receive loop");
                         // Disconnected
                         break;
                     }
@@ -1085,6 +1273,7 @@ namespace LibUA
 
                     if (consumedSize == -1)
                     {
+                        System.Diagnostics.Debug.WriteLine("[Client] Consume returned -1, handlerStatus=" + recvHandlerStatus + ", breaking inner loop");
                         // Handler failed
                         recvAccumSize = -1;
                         break;
@@ -1106,11 +1295,7 @@ namespace LibUA
                     else
                     {
                         int newSize = recvAccumSize - consumedSize;
-
-                        var newRecvBuffer = new byte[MaximumMessageSize];
-                        Array.Copy(recvBuffer, consumedSize, newRecvBuffer, 0, newSize);
-                        recvBuffer = newRecvBuffer;
-
+                        Array.Copy(recvBuffer, consumedSize, recvBuffer, 0, newSize);
                         recvAccumSize = newSize;
                     }
                 }
@@ -1120,10 +1305,12 @@ namespace LibUA
                 // Cannot receive more or process existing
                 if (recvAccumSize == -1 || recvAccumSize >= MaximumMessageSize)
                 {
+                    System.Diagnostics.Debug.WriteLine("[Client] Receive loop exit: recvAccumSize=" + recvAccumSize + ", threadAbort=" + threadAbort);
                     break;
                 }
             }
 
+            System.Diagnostics.Debug.WriteLine("[Client] Thread target exiting, calling CloseConnection, threadAbort=" + threadAbort);
             CloseConnection();
 
             //if (DXPStatusCode.IsGood(connStatus))
@@ -1134,7 +1321,7 @@ namespace LibUA
             // Fail any pending calls with connStatus
             //semRecvMsg.Release();
 
-            lock (recvNotify)
+            lock (recvNotifyLock)
             {
                 foreach (var kvp in recvNotify)
                 {
@@ -1142,11 +1329,15 @@ namespace LibUA
                 }
             }
 
-            lock (recvQueue)
+            lock (recvQueueLock)
             {
-                foreach (var notifyAbort in recvNotify)
+                foreach (var kvp in recvQueue)
                 {
-                    notifyAbort.Value.Set();
+                    if (recvNotify.TryGetValue(kvp.Key, out ManualResetEvent ev))
+                    {
+                        ev.Set();
+                    }
+                    kvp.Value.RecvBuf?.Dispose();
                 }
             }
         }
@@ -1214,39 +1405,42 @@ namespace LibUA
                 return null;
             }
 
-            MemoryBuffer tmpBuf = new MemoryBuffer(buf.Capacity);
-            MemoryBuffer recvBuf = new MemoryBuffer(buf.Capacity);
-
-            uint readOffset = 0;
-            int decodedDecrTotal = 0;
-            for (int i = 0; i < chunkLengths.Count; i++)
+            using (MemoryBuffer tmpBuf = new MemoryBuffer(buf.Capacity))
             {
-                uint len = chunkLengths[i];
-                Array.Copy(buf.Buffer, readOffset, tmpBuf.Buffer, 0, (int)len);
+                MemoryBuffer recvBuf = new MemoryBuffer(buf.Capacity);
 
-                tmpBuf.Position = 3;
-                var unsecureRes = (uint)UASecurity.UnsecureSymmetric(tmpBuf, config.TokenID, config.PrevTokenID, MessageEncodedBlockStart, config.LocalKeysets[0], config.RemoteKeysets, config.SecurityPolicy, config.MessageSecurityMode, out int decrSize);
-                if (!Types.StatusCodeIsGood(unsecureRes))
+                uint readOffset = 0;
+                int decodedDecrTotal = 0;
+                for (int i = 0; i < chunkLengths.Count; i++)
                 {
-                    return null;
+                    uint len = chunkLengths[i];
+                    Array.Copy(buf.Buffer, readOffset, tmpBuf.Buffer, 0, (int)len);
+
+                    tmpBuf.Position = 3;
+                    var unsecureRes = (uint)UASecurity.UnsecureSymmetric(tmpBuf, config.TokenID, config.PrevTokenID, MessageEncodedBlockStart, config.LocalKeysets[0], config.RemoteKeysets, config.SecurityPolicy, config.MessageSecurityMode, out int decrSize);
+                    if (!Types.StatusCodeIsGood(unsecureRes))
+                    {
+                        recvBuf?.Dispose();
+                        return null;
+                    }
+
+                    decodedDecrTotal += decrSize;
+
+                    if (i == 0)
+                    {
+                        Array.Copy(tmpBuf.Buffer, 0, recvBuf.Buffer, 0, ChunkHeaderOverhead);
+                        recvBuf.Buffer[3] = (byte)'F';
+                        recvBuf.Position = ChunkHeaderOverhead;
+                    }
+
+                    recvBuf.Append(tmpBuf.Buffer, ChunkHeaderOverhead, (int)(decrSize - ChunkHeaderOverhead));
+                    readOffset += len;
                 }
 
-                decodedDecrTotal += decrSize;
+                MarkPositionAsSize(recvBuf);
 
-                if (i == 0)
-                {
-                    Array.Copy(tmpBuf.Buffer, 0, recvBuf.Buffer, 0, ChunkHeaderOverhead);
-                    recvBuf.Buffer[3] = (byte)'F';
-                    recvBuf.Position = ChunkHeaderOverhead;
-                }
-
-                recvBuf.Append(tmpBuf.Buffer, ChunkHeaderOverhead, (int)(decrSize - ChunkHeaderOverhead));
-                readOffset += len;
+                return recvBuf;
             }
-
-            MarkPositionAsSize(recvBuf);
-
-            return recvBuf;
         }
 
         private List<uint> ChunkCalculateSizes(MemoryBuffer memBuf)
@@ -1295,6 +1489,8 @@ namespace LibUA
 
         private int Consume(SLChannel config, MemoryBuffer recvBuf)
         {
+            ManualResetEvent ev = null;
+
             // No message type and size
             if (recvBuf.Capacity < 8)
             {
@@ -1337,6 +1533,7 @@ namespace LibUA
 
                         if (!Types.StatusCodeIsGood(unsecureRes))
                         {
+                            System.Diagnostics.Debug.WriteLine("[Client] UnsecureSymmetric failed: " + unsecureRes + " for messageType=" + messageType);
                             return -1;
                         }
                     }
@@ -1357,6 +1554,7 @@ namespace LibUA
 
                     if (recvBuf == null)
                     {
+                        System.Diagnostics.Debug.WriteLine("[Client] ChunkReconstructSecured failed");
                         recvHandlerStatus = StatusCode.BadMessageNotAvailable;
                         return -1;
                     }
@@ -1365,6 +1563,7 @@ namespace LibUA
                 {
                     if (!ChunkReconstruct(recvBuf, chunkSizes))
                     {
+                        System.Diagnostics.Debug.WriteLine("[Client] ChunkReconstruct failed");
                         recvHandlerStatus = StatusCode.BadMessageNotAvailable;
                         return -1;
                     }
@@ -1380,6 +1579,7 @@ namespace LibUA
             }
             else
             {
+                System.Diagnostics.Debug.WriteLine("[Client] Unknown message type byte: " + (char)recvBuf.Buffer[3] + ", msgType=" + messageType);
                 recvHandlerStatus = StatusCode.BadMessageNotAvailable;
                 return -1;
             }
@@ -1388,7 +1588,7 @@ namespace LibUA
 
             if (messageType == (uint)MessageType.Acknowledge)
             {
-                lock (recvQueue)
+                lock (recvQueueLock)
                 {
                     var key = new Tuple<uint, uint>(messageType, 0);
                     recvQueue[key] = new RecvHandler()
@@ -1398,7 +1598,7 @@ namespace LibUA
                         Type = NodeId.Zero
                     };
 
-                    if (recvNotify.TryGetValue(key, out ManualResetEvent ev))
+                    if (recvNotify.TryGetValue(key, out ev))
                     {
                         ev.Set();
                     }
@@ -1412,11 +1612,10 @@ namespace LibUA
 
                 if (messageSize > recvBuf.Capacity)
                 {
-                    return 0;
+                    unchecked { return (int)(uint)StatusCode.BadRequestTimeout; }
                 }
 
-                ManualResetEvent ev = null;
-                lock (recvQueue)
+                lock (recvQueueLock)
                 {
                     var key = new Tuple<uint, uint>(messageType, 0);
                     recvQueue[key] = new RecvHandler()
@@ -1437,6 +1636,7 @@ namespace LibUA
                 if (ev != null)
                 {
                     csWaitForSecure.WaitOne();
+                    csWaitForSecure.Reset();
                 }
             }
             else if (messageType == (uint)MessageType.Error)
@@ -1473,6 +1673,7 @@ namespace LibUA
 
                 if (!succeeded)
                 {
+                    System.Diagnostics.Debug.WriteLine("[Client] Decode error after security processing, messageType=" + messageType);
                     recvHandlerStatus = StatusCode.BadDecodingError;
                     return -1;
                 }
@@ -1496,7 +1697,7 @@ namespace LibUA
                 }
                 else
                 {
-                    lock (recvQueue)
+                    lock (recvQueueLock)
                     {
                         var recvKey = new Tuple<uint, uint>(messageType, respHeader.RequestHandle);
                         recvQueue[recvKey] = new RecvHandler()
@@ -1506,7 +1707,7 @@ namespace LibUA
                             Type = typeId
                         };
 
-                        if (recvNotify.TryGetValue(recvKey, out ManualResetEvent ev))
+                        if (recvNotify.TryGetValue(recvKey, out ev))
                         {
                             ev.Set();
                         }
@@ -1519,377 +1720,628 @@ namespace LibUA
 
         public StatusCode ActivateSession(object identityToken, string[] localeIDs, SecurityPolicy? userIdentitySecurityPolicy = null)
         {
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
 
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.ActivateSessionRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                // Calculate challenge:
-                var strRemoteCert = config.RemoteCertificateString;
-                var challenge = new byte[(strRemoteCert?.Length ?? 0)
-                                         + (config.RemoteNonce?.Length ?? 0)];
-                var offset = 0;
-                if (strRemoteCert != null)
-                {
-                    Array.Copy(strRemoteCert, 0, challenge, offset, strRemoteCert.Length);
-                    offset += strRemoteCert.Length;
-                }
-
-                if (config.RemoteNonce != null)
-                {
-                    Array.Copy(config.RemoteNonce, 0, challenge, offset, config.RemoteNonce.Length);
-                    offset += config.RemoteNonce.Length;
-                }
-
-                if (config.MessageSecurityMode == MessageSecurityMode.None)
-                {
-                    // ClientSignatureAlgorithm
-                    succeeded &= sendBuf.EncodeUAString((string)null);
-                    // ClientSignature
-                    succeeded &= sendBuf.EncodeUAByteString(null);
-                }
-                else
-                {
-                    if (challenge.Length == 0)
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return StatusCode.BadSessionClosed;
+                        return headerRes;
                     }
 
-                    var algorithm = UASecurity.SignatureAlgorithmForSecurityPolicy(config.SecurityPolicy);
-                    var thumbprint = UASecurity.Sign(new ArraySegment<byte>(challenge),
-                        ApplicationPrivateKey, config.SecurityPolicy);
-
-                    succeeded &= sendBuf.EncodeUAString(algorithm);
-                    succeeded &= sendBuf.EncodeUAByteString(thumbprint);
-                }
-
-                // ClientSoftwareCertificates: Array of SignedSoftwareCertificate
-                succeeded &= sendBuf.Encode((UInt32)0);
-
-                // LocaleIds: Array of String
-                succeeded &= sendBuf.EncodeUAString(localeIDs);
-
-                if (identityToken is UserIdentityAnonymousToken token)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.AnonymousIdentityToken_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.EncodeUAString(token.PolicyId);
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else if (identityToken is UserIdentityUsernameToken usernameToken)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.UserNameIdentityToken_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.EncodeUAString(usernameToken.PolicyId);
-                    succeeded &= sendBuf.EncodeUAString(usernameToken.Username);
-
-                    try
+                    var reqHeader = new RequestHeader()
                     {
-                        var passwordSrc = usernameToken.PasswordHash;
-                        int padSize = UASecurity.CalculatePaddingSize(config.RemoteCertificate,
-                            userIdentitySecurityPolicy ?? config.SecurityPolicy, 4 + passwordSrc.Length,
-                            (config.RemoteNonce == null ? 0 : config.RemoteNonce.Length));
-                        var rndBytes = UASecurity.GenerateRandomBytes(padSize);
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                        byte[] crypted = new byte[4 + passwordSrc.Length + padSize +
-                            (config.RemoteNonce == null ? 0 : config.RemoteNonce.Length)];
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.ActivateSessionRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                        int rawSize = passwordSrc.Length +
-                            (config.RemoteNonce == null ? 0 : config.RemoteNonce.Length);
+                    // Calculate challenge:
+                    var strRemoteCert = config.RemoteCertificateString;
+                    var challenge = new byte[(strRemoteCert?.Length ?? 0)
+                                             + (config.RemoteNonce?.Length ?? 0)];
+                    var offset = 0;
+                    if (strRemoteCert != null)
+                    {
+                        Array.Copy(strRemoteCert, 0, challenge, offset, strRemoteCert.Length);
+                        offset += strRemoteCert.Length;
+                    }
 
-                        crypted[0] = (byte)(rawSize & 0xFF);
-                        crypted[1] = (byte)((rawSize >> 8) & 0xFF);
-                        crypted[2] = (byte)((rawSize >> 16) & 0xFF);
-                        crypted[3] = (byte)((rawSize >> 24) & 0xFF);
+                    if (config.RemoteNonce != null)
+                    {
+                        Array.Copy(config.RemoteNonce, 0, challenge, offset, config.RemoteNonce.Length);
+                        offset += config.RemoteNonce.Length;
+                    }
 
-                        Array.Copy(passwordSrc, 0, crypted, 4, passwordSrc.Length);
-
-                        offset = 4 + passwordSrc.Length;
-
-                        if (config.RemoteNonce != null)
+                    if (config.MessageSecurityMode == MessageSecurityMode.None)
+                    {
+                        // ClientSignatureAlgorithm
+                        succeeded &= sendBuf.EncodeUAString((string)null);
+                        // ClientSignature
+                        succeeded &= sendBuf.EncodeUAByteString(null);
+                    }
+                    else
+                    {
+                        if (challenge.Length == 0)
                         {
-                            Array.Copy(config.RemoteNonce, 0, crypted, offset, config.RemoteNonce.Length);
-                            offset += config.RemoteNonce.Length;
-                        }
-                        else
-                        {
-                            Array.Copy(rndBytes, 0, crypted, offset, rndBytes.Length);
-                            offset += rndBytes.Length;
+                            return StatusCode.BadSessionClosed;
                         }
 
-                        if (userIdentitySecurityPolicy != null)
-                        {
-                            crypted = UASecurity.Encrypt(
-                                new ArraySegment<byte>(crypted),
-                                config.RemoteCertificate, UASecurity.UseOaepForSecurityPolicy((SecurityPolicy)userIdentitySecurityPolicy));
-                        }
+                        var algorithm = UASecurity.SignatureAlgorithmForSecurityPolicy(config.SecurityPolicy);
+                        var thumbprint = UASecurity.Sign(new ArraySegment<byte>(challenge),
+                            ApplicationPrivateKey, config.SecurityPolicy);
 
-                        succeeded &= sendBuf.EncodeUAByteString(crypted);
-                        succeeded &= sendBuf.EncodeUAString(usernameToken.Algorithm);
-                    }
-                    catch
-                    {
-                        return StatusCode.BadIdentityTokenInvalid;
+                        succeeded &= sendBuf.EncodeUAString(algorithm);
+                        succeeded &= sendBuf.EncodeUAByteString(thumbprint);
                     }
 
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else if (identityToken is UserIdentityX509IdentityToken x509Token)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.X509IdentityToken_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-
-                    int eoStartPos = sendBuf.Position;
+                    // ClientSoftwareCertificates: Array of SignedSoftwareCertificate
                     succeeded &= sendBuf.Encode((UInt32)0);
 
-                    succeeded &= sendBuf.EncodeUAString(x509Token.PolicyId);
-                    succeeded &= sendBuf.EncodeUAByteString(x509Token.CertificateData);
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else
-                {
-                    throw new Exception(string.Format("Identity token of type {0} is not supported", identityToken.GetType().ToString()));
-                }
+                    // LocaleIds: Array of String
+                    succeeded &= sendBuf.EncodeUAString(localeIDs);
 
-                if (identityToken is UserIdentityX509IdentityToken x509IdentityToken)
-                {
-                    if (challenge.Length == 0)
+                    if (identityToken is UserIdentityAnonymousToken token)
                     {
-                        return StatusCode.BadSessionClosed;
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.AnonymousIdentityToken_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.EncodeUAString(token.PolicyId);
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
+                    }
+                    else if (identityToken is UserIdentityUsernameToken usernameToken)
+                    {
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.UserNameIdentityToken_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.EncodeUAString(usernameToken.PolicyId);
+                        succeeded &= sendBuf.EncodeUAString(usernameToken.Username);
+
+                        try
+                        {
+                            var passwordSrc = usernameToken.PasswordHash;
+                            int padSize = UASecurity.CalculatePaddingSizePolicyUri(config.RemoteCertificate,usernameToken.Algorithm, 4 + passwordSrc.Length,(config.RemoteNonce == null ? 0 : config.RemoteNonce.Length));
+                            var rndBytes = UASecurity.GenerateRandomBytes(padSize);
+
+                            byte[] crypted = new byte[4 + passwordSrc.Length + padSize +
+                                (config.RemoteNonce == null ? 0 : config.RemoteNonce.Length)];
+
+                            int rawSize = passwordSrc.Length +
+                                (config.RemoteNonce == null ? 0 : config.RemoteNonce.Length);
+
+                            crypted[0] = (byte)(rawSize & 0xFF);
+                            crypted[1] = (byte)((rawSize >> 8) & 0xFF);
+                            crypted[2] = (byte)((rawSize >> 16) & 0xFF);
+                            crypted[3] = (byte)((rawSize >> 24) & 0xFF);
+
+                            Array.Copy(passwordSrc, 0, crypted, 4, passwordSrc.Length);
+
+                            offset = 4 + passwordSrc.Length;
+
+                            if (config.RemoteNonce != null)
+                            {
+                                Array.Copy(config.RemoteNonce, 0, crypted, offset, config.RemoteNonce.Length);
+                                offset += config.RemoteNonce.Length;
+                            }
+                            else
+                            {
+                                Array.Copy(rndBytes, 0, crypted, offset, rndBytes.Length);
+                                offset += rndBytes.Length;
+                            }
+                            if (userIdentitySecurityPolicy != null)
+                            {
+                                crypted = UASecurity.Encrypt(
+                                    new ArraySegment<byte>(crypted),
+                                    config.RemoteCertificate, UASecurity.UseOaepForSecurityPolicy((SecurityPolicy)userIdentitySecurityPolicy));
+                            }
+
+                            succeeded &= sendBuf.EncodeUAByteString(crypted);
+                            succeeded &= sendBuf.EncodeUAString(usernameToken.Algorithm);
+                        }
+                        catch
+                        {
+                            return StatusCode.BadSecurityChecksFailed;
+                        }
+
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
+                    }
+                    else if (identityToken is UserIdentityX509IdentityToken x509Token)
+                    {
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.X509IdentityToken_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.EncodeUAString(x509Token.PolicyId);
+                        succeeded &= sendBuf.EncodeUAByteString(x509Token.CertificateData);
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
+                    }
+                    else
+                    {
+                        throw new Exception(string.Format("Identity token of type {0} is not supported", identityToken.GetType().ToString()));
                     }
 
-                    var algorithm = UASecurity.SignatureAlgorithmForSecurityPolicy(config.SecurityPolicy);
-                    var thumbprint = UASecurity.Sign(new ArraySegment<byte>(challenge),
-                        x509IdentityToken.PrivateKey, config.SecurityPolicy);
-
-                    succeeded &= sendBuf.EncodeUAString(algorithm);
-                    succeeded &= sendBuf.EncodeUAByteString(thumbprint);
-                }
-                else
-                {
-                    // userTokenAlgorithm
-                    succeeded &= sendBuf.EncodeUAString((string)null);
-                    // userTokenSignature
-                    succeeded &= sendBuf.EncodeUAByteString(null);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    if (identityToken is UserIdentityX509IdentityToken x509IdentityToken)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        if (challenge.Length == 0)
+                        {
+                            return StatusCode.BadSessionClosed;
+                        }
+
+                        var algorithm = UASecurity.SignatureAlgorithmForSecurityPolicy(config.SecurityPolicy);
+                        var thumbprint = UASecurity.Sign(new ArraySegment<byte>(challenge),
+                            x509IdentityToken.PrivateKey, config.SecurityPolicy);
+
+                        succeeded &= sendBuf.EncodeUAString(algorithm);
+                        succeeded &= sendBuf.EncodeUAByteString(thumbprint);
+                    }
+                    else
+                    {
+                        // userTokenAlgorithm
+                        succeeded &= sendBuf.EncodeUAString((string)null);
+                        // userTokenSignature
+                        succeeded &= sendBuf.EncodeUAByteString(null);
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ActivateSessionResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce);
-                config.RemoteNonce = serverNonce;
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                renewTimer?.Stop();
-
-                renewTimer = new System.Timers.Timer(0.7 * config.TokenLifetime);
-                renewTimer.Elapsed += (sender, e) =>
-                {
-                    var res = RenewSecureChannel();
-                    if (!Types.StatusCodeIsGood((uint)res))
+                    if (!succeeded)
                     {
-                        recvHandlerStatus = res;
-                        Disconnect();
+                        return StatusCode.BadEncodingLimitsExceeded;
                     }
-                };
-                renewTimer.Start();
 
-                return StatusCode.Good;
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ActivateSessionResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce);
+                    config.RemoteNonce = serverNonce;
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    renewTimer?.Stop();
+
+                    renewTimer = new System.Timers.Timer(0.7 * config.TokenLifetime);
+                    renewTimer.Elapsed += (sender, e) =>
+                    {
+                        try
+                        {
+                            cs.WaitOne();
+                            try
+                            {
+                                var res = OpenSecureChannelInternal(true, acquireSemaphore: false);
+                                if (!Types.StatusCodeIsGood((uint)res))
+                                {
+                                    recvHandlerStatus = res;
+                                    Disconnect();
+                                }
+                            }
+                            finally
+                            {
+                                cs.Release();
+                                csWaitForSecure.Reset();
+                                csWaitForSecure.Set();
+                            }
+                        }
+                        catch { }
+                    };
+                    renewTimer.Start();
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
         }
 
+        private static StatusCode CheckServiceFaultResponse(RecvHandler recvHandler)
+        {
+            if (recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ServiceFault) &&
+                recvHandler.Header != null && Enum.IsDefined(typeof(StatusCode), recvHandler.Header.ServiceResult))
+            {
+                return (StatusCode)recvHandler.Header.ServiceResult;
+            }
+
+            return StatusCode.BadUnknownResponse;
+        }
+
         public StatusCode CreateSession(ApplicationDescription appDesc, string sessionName, int requestedSessionTimeout)
         {
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.CreateSessionRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode(appDesc);
-                // ServerUri
-                succeeded &= sendBuf.EncodeUAString((string)null);
-                succeeded &= sendBuf.EncodeUAString(string.Format("opc.tcp://{0}:{1}", config.Endpoint.Address.ToString(), config.Endpoint.Port.ToString()));
-                succeeded &= sendBuf.EncodeUAString(sessionName);
-                succeeded &= sendBuf.EncodeUAByteString(config.LocalNonce);
-                if (ApplicationCertificate == null)
-                {
-                    succeeded &= sendBuf.EncodeUAByteString(null);
-                }
-                else
-                {
-                    succeeded &= sendBuf.EncodeUAByteString(ApplicationCertificate.Export(X509ContentType.Cert));
-                }
-                succeeded &= sendBuf.Encode((Double)(10000 * requestedSessionTimeout));
-                succeeded &= sendBuf.Encode((UInt32)MaximumMessageSize);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.CreateSessionRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode(appDesc);
+                    // ServerUri
+                    succeeded &= sendBuf.EncodeUAString((string)null);
+                    succeeded &= sendBuf.EncodeUAString(GetEndpointString());
+                    succeeded &= sendBuf.EncodeUAString(sessionName);
+                    succeeded &= sendBuf.EncodeUAByteString(config.LocalNonce);
+                    if (ApplicationCertificate == null)
+                    {
+                        succeeded &= sendBuf.EncodeUAByteString(null);
+                    }
+                    else
+                    {
+                        succeeded &= sendBuf.EncodeUAByteString(ApplicationCertificate.Export(X509ContentType.Cert));
+                    }
+                    succeeded &= sendBuf.Encode((Double)(1000 * requestedSessionTimeout));
+                    succeeded &= sendBuf.Encode((UInt32)MaximumMessageSize);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CreateSessionResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.Decode(out NodeId sessionIdToken);
+                    succeeded &= recvHandler.RecvBuf.Decode(out NodeId authToken);
+                    succeeded &= recvHandler.RecvBuf.Decode(out double revisedSessionTimeout);
+
+                    config.TokenLifetime = (uint)(revisedSessionTimeout);
+
+                    if (renewTimer != null)
+                    {
+                        renewTimer.Stop();
+                        renewTimer.Interval = 0.7 * config.TokenLifetime;
+                        renewTimer.Start();
+                    }
+
+                    config.SessionIdToken = sessionIdToken;
+                    config.AuthToken = authToken;
+
+                    succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce);
+                    succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverCert);
+
+                    config.RemoteNonce = serverNonce;
+                    try
+                    {
+#pragma warning disable SYSLIB0057 // X509CertificateLoader unavailable on net462 target
+                        config.RemoteCertificate = new X509Certificate2(serverCert);
+#pragma warning restore SYSLIB0057
+                    }
+                    catch
+                    {
+                        return StatusCode.BadSecurityChecksFailed;
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CreateSessionResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.Decode(out NodeId sessionIdToken);
-                succeeded &= recvHandler.RecvBuf.Decode(out NodeId authToken);
-                succeeded &= recvHandler.RecvBuf.Decode(out double revisedSessionTimeout);
-
-                config.SessionIdToken = sessionIdToken;
-                config.AuthToken = authToken;
-
-                succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverNonce);
-                succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] serverCert);
-
-                config.RemoteNonce = serverNonce;
-                try
-                {
-                    config.RemoteCertificate = new X509Certificate2(serverCert);
-                }
-                catch
-                {
-                    return StatusCode.BadSecurityChecksFailed;
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode CloseSession()
+        {
+            RecvHandler recvHandler = null;
+
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.CloseSessionRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+                    bool deleteSubscriptions = false;
+                    succeeded &= sendBuf.Encode(deleteSubscriptions);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CloseSessionResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode Read(ArraySegment<ReadValueId> Ids, ArraySegment<DataValue> results)
+        {
+            if (Ids.Count == 0)
+            {
+                return StatusCode.Good;
+            }
+
+            if (Ids.Count != results.Count)
+            {
+                throw new Exception("Number of results must match number of Ids.");
+            }
+
+            RecvHandler recvHandler = null;
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.UtcNow,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.ReadRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    // maxAge
+                    succeeded &= sendBuf.Encode((double)0);
+                    // LocaleIds
+                    succeeded &= sendBuf.Encode((uint)TimestampsToReturn.Both);
+                    succeeded &= sendBuf.Encode((uint)Ids.Count);
+                    for (int i = 0; i < Ids.Count; i++)
+                    {
+                        succeeded &= sendBuf.Encode(Ids.Get(i));
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ReadResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        if (results.Get(i) == null)
+                        {
+                            results.Set(i, new DataValue());
+                        }
+
+                        succeeded &= recvHandler.RecvBuf.Decode(results.Get(i));
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    if (numRecv != Ids.Count)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -1897,107 +2349,121 @@ namespace LibUA
 
         public StatusCode Read(ReadValueId[] Ids, out DataValue[] results)
         {
-            results = null;
+            results = new DataValue[Ids.Length];
+            return Read(Ids.AsSegment(), results.AsSegment());
+        }
 
+        public StatusCode Write(ArraySegment<WriteValue> Ids, ArraySegment<uint> results)
+        {
+            if (Ids.Count == 0)
+            {
+                return StatusCode.Good;
+            }
+
+            if (Ids.Count != results.Count)
+            {
+                throw new Exception("Number of results must match number of Ids.");
+            }
+
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.ReadRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                // maxAge
-                succeeded &= sendBuf.Encode((double)0);
-                // LocaleIds
-                succeeded &= sendBuf.Encode((UInt32)TimestampsToReturn.Both);
-                succeeded &= sendBuf.Encode((UInt32)Ids.Length);
-                for (int i = 0; i < Ids.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(Ids[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.WriteRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)Ids.Count);
+                    for (int i = 0; i < Ids.Count; i++)
+                    {
+                        succeeded &= sendBuf.Encode(Ids.Get(i));
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.WriteResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    uint v;
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out v);
+                        results.Set(i, v);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    if (numRecv != Ids.Count)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ReadResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                results = new DataValue[numRecv];
-                for (int i = 0; i < numRecv && succeeded; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                if (numRecv != Ids.Length)
-                {
-                    return StatusCode.GoodResultsMayBeIncomplete;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2005,103 +2471,433 @@ namespace LibUA
 
         public StatusCode Write(WriteValue[] Ids, out uint[] results)
         {
+            results = new uint[Ids.Length];
+            return Write(Ids.AsSegment(), results.AsSegment());
+        }
+
+        public StatusCode AddNodes(AddNodesItem[] addNodesItems, out AddNodesResult[] results)
+        {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.WriteRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)Ids.Length);
-                for (int i = 0; i < Ids.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(Ids[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.AddNodesRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)addNodesItems.Length);
+                    for (int i = 0; i < addNodesItems.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(addNodesItems[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.AddNodesResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new AddNodesResult[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    if (numRecv != addNodesItems.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.WriteResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                results = new uint[numRecv];
-                for (int i = 0; i < numRecv && succeeded; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                if (numRecv != Ids.Length)
-                {
-                    return StatusCode.GoodResultsMayBeIncomplete;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode DeleteNodes(DeleteNodesItem[] deleteNodesItems, out uint[] results)
+        {
+            results = null;
+
+            RecvHandler recvHandler = null;
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.DeleteNodesRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)deleteNodesItems.Length);
+                    for (int i = 0; i < deleteNodesItems.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(deleteNodesItems[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.DeleteNodesResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new uint[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    if (numRecv != deleteNodesItems.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode AddReferences(AddReferencesItem[] addReferencesItems, out uint[] results)
+        {
+            results = null;
+
+            RecvHandler recvHandler = null;
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.AddReferencesRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)addReferencesItems.Length);
+                    for (int i = 0; i < addReferencesItems.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(addReferencesItems[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.AddReferencesResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new uint[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    if (numRecv != addReferencesItems.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode DeleteReferences(DeleteReferencesItem[] deleteReferencesItems, out uint[] results)
+        {
+            results = null;
+
+            RecvHandler recvHandler = null;
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.DeleteReferencesRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)deleteReferencesItems.Length);
+                    for (int i = 0; i < deleteReferencesItems.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(deleteReferencesItems[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.DeleteReferencesResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new uint[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    if (numRecv != deleteReferencesItems.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2111,207 +2907,89 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.BrowseRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                // ViewId
-                succeeded &= sendBuf.Encode(NodeId.Zero);
-                // View timestamp
-                succeeded &= sendBuf.Encode((UInt64)0);
-                // View version
-                succeeded &= sendBuf.Encode((UInt32)0);
-
-                succeeded &= sendBuf.Encode((UInt32)requestedMaxReferencesPerNode);
-
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(requests[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.BrowseResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                results = new BrowseResult[numRecv];
-                for (int i = 0; i < numRecv && succeeded; i++)
-                {
-                    ReferenceDescription[] refDescs;
-
-                    succeeded &= recvHandler.RecvBuf.Decode(out uint status);
-                    succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] contPoint);
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRefDesc);
-
-                    refDescs = new ReferenceDescription[numRefDesc];
-                    for (int j = 0; j < refDescs.Length; j++)
+                    var reqHeader = new RequestHeader()
                     {
-                        succeeded &= recvHandler.RecvBuf.Decode(out refDescs[j]);
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.BrowseRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    // ViewId
+                    succeeded &= sendBuf.Encode(NodeId.Zero);
+                    // View timestamp
+                    succeeded &= sendBuf.Encode((UInt64)0);
+                    // View version
+                    succeeded &= sendBuf.Encode((UInt32)0);
+
+                    succeeded &= sendBuf.Encode((UInt32)requestedMaxReferencesPerNode);
+
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(requests[i]);
                     }
 
-                    results[i] = new BrowseResult(status, contPoint, refDescs);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                if (numRecv != requests.Length)
-                {
-                    return StatusCode.GoodResultsMayBeIncomplete;
-                }
-
-                return StatusCode.Good;
-            }
-            finally
-            {
-                cs.Release();
-                CheckPostCall();
-            }
-        }
-
-        public StatusCode BrowseNext(IList<byte[]> contPoints, bool releaseContinuationPoints, out BrowseResult[] results)
-        {
-            results = null;
-
-            try
-            {
-                cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
-                {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.BrowseNextRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode(releaseContinuationPoints);
-                succeeded &= sendBuf.Encode((UInt32)contPoints.Count);
-                for (int i = 0; i < contPoints.Count; i++)
-                {
-                    succeeded &= sendBuf.EncodeUAByteString(contPoints[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    if (!succeeded)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return StatusCode.BadEncodingLimitsExceeded;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.BrowseNextResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
 
-                if (!releaseContinuationPoints)
-                {
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.BrowseResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
                     succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
 
                     results = new BrowseResult[numRecv];
@@ -2323,6 +3001,7 @@ namespace LibUA
                         succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] contPoint);
                         succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRefDesc);
 
+                        if (numRefDesc == uint.MaxValue) { numRefDesc = 0; }
                         refDescs = new ReferenceDescription[numRefDesc];
                         for (int j = 0; j < refDescs.Length; j++)
                         {
@@ -2337,21 +3016,145 @@ namespace LibUA
                         return StatusCode.BadDecodingError;
                     }
 
-                    if (numRecv != contPoints.Count)
+                    if (numRecv != requests.Length)
                     {
                         return StatusCode.GoodResultsMayBeIncomplete;
                     }
-                }
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
+                    return StatusCode.Good;
                 }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
+                cs.Release();
+                CheckPostCall();
+            }
+        }
+
+        public StatusCode BrowseNext(IList<byte[]> contPoints, bool releaseContinuationPoints, out BrowseResult[] results)
+        {
+            results = null;
+
+            RecvHandler recvHandler = null;
+            try
+            {
+                cs.WaitOne();
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
+                {
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.BrowseNextRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode(releaseContinuationPoints);
+                    succeeded &= sendBuf.Encode((UInt32)contPoints.Count);
+                    for (int i = 0; i < contPoints.Count; i++)
+                    {
+                        succeeded &= sendBuf.EncodeUAByteString(contPoints[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.BrowseNextResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    if (!releaseContinuationPoints)
+                    {
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                        results = new BrowseResult[numRecv];
+                        for (int i = 0; i < numRecv && succeeded; i++)
+                        {
+                            ReferenceDescription[] refDescs;
+
+                            succeeded &= recvHandler.RecvBuf.Decode(out uint status);
+                            succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] contPoint);
+                            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRefDesc);
+
+                            refDescs = new ReferenceDescription[numRefDesc];
+                            for (int j = 0; j < refDescs.Length; j++)
+                            {
+                                succeeded &= recvHandler.RecvBuf.Decode(out refDescs[j]);
+                            }
+
+                            results[i] = new BrowseResult(status, contPoint, refDescs);
+                        }
+
+                        if (!succeeded)
+                        {
+                            return StatusCode.BadDecodingError;
+                        }
+
+                        if (numRecv != contPoints.Count)
+                        {
+                            return StatusCode.GoodResultsMayBeIncomplete;
+                        }
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2361,208 +3164,220 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.HistoryReadRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                if (historyReadDetails is ReadRawModifiedDetails details)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadRawModifiedDetails_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.Encode(details.IsReadModified);
-                    succeeded &= sendBuf.Encode((Int64)details.StartTime.ToFileTime());
-                    succeeded &= sendBuf.Encode((Int64)details.EndTime.ToFileTime());
-                    succeeded &= sendBuf.Encode((UInt32)details.NumValuesPerNode);
-                    succeeded &= sendBuf.Encode(details.ReturnBounds);
-
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else if (historyReadDetails is ReadProcessedDetails processedDetails)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadProcessedDetails_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.Encode(processedDetails.StartTime.ToFileTime());
-                    succeeded &= sendBuf.Encode(processedDetails.EndTime.ToFileTime());
-                    succeeded &= sendBuf.Encode(processedDetails.ProcessingInterval);
-
-                    succeeded &= sendBuf.Encode((UInt32)processedDetails.AggregateTypes.Length);
-                    for (int i = 0; i < processedDetails.AggregateTypes.Length; i++)
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        succeeded &= sendBuf.Encode(processedDetails.AggregateTypes[i]);
+                        return headerRes;
                     }
 
-                    succeeded &= sendBuf.Encode(processedDetails.Configuration);
-
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else if (historyReadDetails is ReadAtTimeDetails timeDetails)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadAtTimeDetails_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.Encode(timeDetails.ReqTimes.Length);
-                    for (int i = 0; i < timeDetails.ReqTimes.Length; i++)
+                    var reqHeader = new RequestHeader()
                     {
-                        succeeded &= sendBuf.Encode(timeDetails.ReqTimes[i].ToFileTime());
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.HistoryReadRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    if (historyReadDetails is ReadRawModifiedDetails details)
+                    {
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadRawModifiedDetails_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.Encode(details.IsReadModified);
+                        succeeded &= sendBuf.Encode((Int64)details.StartTime.ToFileTime());
+                        succeeded &= sendBuf.Encode((Int64)details.EndTime.ToFileTime());
+                        succeeded &= sendBuf.Encode((UInt32)details.NumValuesPerNode);
+                        succeeded &= sendBuf.Encode(details.ReturnBounds);
+
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
                     }
-
-                    succeeded &= sendBuf.Encode(timeDetails.UseSimpleBounds);
-
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else if (historyReadDetails is ReadEventDetails eventDetails)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadEventDetails_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.Encode(eventDetails.NumValuesPerNode);
-                    succeeded &= sendBuf.Encode(eventDetails.StartTime.ToFileTime());
-                    succeeded &= sendBuf.Encode(eventDetails.EndTime.ToFileTime());
-                    succeeded &= sendBuf.Encode(new EventFilter(eventDetails.SelectClauses, null), false);
-
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-                else
-                {
-                    throw new Exception(string.Format("History read details of type {0} is not supported", historyReadDetails.GetType().ToString()));
-                }
-
-                succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
-                succeeded &= sendBuf.Encode(releaseContinuationPoints);
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(requests[i].NodeId);
-                    succeeded &= sendBuf.EncodeUAString(requests[i].IndexRange);
-                    succeeded &= sendBuf.Encode(requests[i].DataEncoding);
-                    succeeded &= sendBuf.EncodeUAByteString(requests[i].ContinuationPoint);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    else if (historyReadDetails is ReadProcessedDetails processedDetails)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
-                    }
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadProcessedDetails_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
 
-                    recvQueue.Remove(recvKey);
-                }
+                        succeeded &= sendBuf.Encode(processedDetails.StartTime.ToFileTime());
+                        succeeded &= sendBuf.Encode(processedDetails.EndTime.ToFileTime());
+                        succeeded &= sendBuf.Encode(processedDetails.ProcessingInterval);
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.HistoryReadResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                if (!releaseContinuationPoints)
-                {
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                    results = new HistoryReadResult[numRecv];
-                    for (int i = 0; i < numRecv && succeeded; i++)
-                    {
-
-
-                        succeeded &= recvHandler.RecvBuf.Decode(out uint status);
-                        succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] contPoint);
-                        succeeded &= recvHandler.RecvBuf.Decode(out NodeId type);
-                        succeeded &= recvHandler.RecvBuf.Decode(out byte eoBodyMask);
-                        if (eoBodyMask != 1)
+                        succeeded &= sendBuf.Encode((UInt32)processedDetails.AggregateTypes.Length);
+                        for (int i = 0; i < processedDetails.AggregateTypes.Length; i++)
                         {
-                            return StatusCode.BadDataEncodingInvalid;
+                            succeeded &= sendBuf.Encode(processedDetails.AggregateTypes[i]);
                         }
-                        succeeded &= recvHandler.RecvBuf.Decode(out uint eoSize);
 
-                        if (type.EqualsNumeric(0, (uint)UAConst.HistoryData_Encoding_DefaultBinary))
+                        succeeded &= sendBuf.Encode(processedDetails.Configuration);
+
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
+                    }
+                    else if (historyReadDetails is ReadAtTimeDetails timeDetails)
+                    {
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadAtTimeDetails_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.Encode(timeDetails.ReqTimes.Length);
+                        for (int i = 0; i < timeDetails.ReqTimes.Length; i++)
                         {
-                            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
-                            DataValue[] dvs = new DataValue[numDvs];
-                            for (int j = 0; j < numDvs; j++)
+                            succeeded &= sendBuf.Encode(timeDetails.ReqTimes[i].ToFileTime());
+                        }
+
+                        succeeded &= sendBuf.Encode(timeDetails.UseSimpleBounds);
+
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
+                    }
+                    else if (historyReadDetails is ReadEventDetails eventDetails)
+                    {
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.ReadEventDetails_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.Encode(eventDetails.NumValuesPerNode);
+                        succeeded &= sendBuf.Encode(eventDetails.StartTime.ToFileTime());
+                        succeeded &= sendBuf.Encode(eventDetails.EndTime.ToFileTime());
+                        succeeded &= sendBuf.Encode(new EventFilter(eventDetails.SelectClauses, null), false);
+
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
+                    }
+                    else
+                    {
+                        throw new Exception(string.Format("History read details of type {0} is not supported", historyReadDetails.GetType().ToString()));
+                    }
+
+                    succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
+                    succeeded &= sendBuf.Encode(releaseContinuationPoints);
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(requests[i].NodeId);
+                        succeeded &= sendBuf.EncodeUAString(requests[i].IndexRange);
+                        succeeded &= sendBuf.Encode(requests[i].DataEncoding);
+                        succeeded &= sendBuf.EncodeUAByteString(requests[i].ContinuationPoint);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.HistoryReadResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    if (!releaseContinuationPoints)
+                    {
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                        results = new HistoryReadResult[numRecv];
+                        for (int i = 0; i < numRecv && succeeded; i++)
+                        {
+
+
+                            succeeded &= recvHandler.RecvBuf.Decode(out uint status);
+                            succeeded &= recvHandler.RecvBuf.DecodeUAByteString(out byte[] contPoint);
+                            succeeded &= recvHandler.RecvBuf.Decode(out NodeId type);
+                            succeeded &= recvHandler.RecvBuf.Decode(out byte eoBodyMask);
+                            if (eoBodyMask != 1)
                             {
-                                succeeded &= recvHandler.RecvBuf.Decode(out dvs[j]);
+                                return StatusCode.BadDataEncodingInvalid;
                             }
+                            succeeded &= recvHandler.RecvBuf.Decode(out uint eoSize);
 
-                            results[i] = new HistoryReadResult(status, contPoint, dvs);
-                        }
-                        else if (type.EqualsNumeric(0, (uint)UAConst.HistoryEvent_Encoding_DefaultBinary))
-                        {
-                            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
-
-                            DataValue[] dvs = new DataValue[numDvs];
-                            for (int j = 0; succeeded && j < numDvs; j++)
+                            if (type.EqualsNumeric(0, (uint)UAConst.HistoryData_Encoding_DefaultBinary))
                             {
-                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numFields);
-                                object[] fields = new object[numFields];
-                                for (int k = 0; succeeded && k < numFields; k++)
+                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
+                                DataValue[] dvs = new DataValue[numDvs];
+                                for (int j = 0; j < numDvs; j++)
                                 {
-                                    succeeded &= recvHandler.RecvBuf.VariantDecode(out fields[k]);
+                                    succeeded &= recvHandler.RecvBuf.Decode(out dvs[j]);
                                 }
 
-                                dvs[j] = new DataValue(fields);
+                                results[i] = new HistoryReadResult(status, contPoint, dvs);
                             }
+                            else if (type.EqualsNumeric(0, (uint)UAConst.HistoryEvent_Encoding_DefaultBinary))
+                            {
+                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDvs);
 
-                            results[i] = new HistoryReadResult(status, contPoint, dvs);
+                                DataValue[] dvs = new DataValue[numDvs];
+                                for (int j = 0; succeeded && j < numDvs; j++)
+                                {
+                                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numFields);
+                                    object[] fields = new object[numFields];
+                                    for (int k = 0; succeeded && k < numFields; k++)
+                                    {
+                                        succeeded &= recvHandler.RecvBuf.VariantDecode(out fields[k]);
+                                    }
+
+                                    dvs[j] = new DataValue(fields);
+                                }
+
+                                results[i] = new HistoryReadResult(status, contPoint, dvs);
+                            }
+                            else
+                            {
+                                return StatusCode.BadDataEncodingInvalid;
+                            }
                         }
-                        else
+
+                        if (!succeeded)
                         {
-                            return StatusCode.BadDataEncodingInvalid;
+                            return StatusCode.BadDecodingError;
+                        }
+
+                        if (numRecv != requests.Length)
+                        {
+                            return StatusCode.GoodResultsMayBeIncomplete;
                         }
                     }
 
@@ -2571,21 +3386,12 @@ namespace LibUA
                         return StatusCode.BadDecodingError;
                     }
 
-                    if (numRecv != requests.Length)
-                    {
-                        return StatusCode.GoodResultsMayBeIncomplete;
-                    }
+                    return StatusCode.Good;
                 }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2595,115 +3401,118 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.HistoryUpdateRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(new NodeId(UAConst.UpdateDataDetails_Encoding_DefaultBinary));
-                    succeeded &= sendBuf.Encode((byte)1);
-                    int eoStartPos = sendBuf.Position;
-                    succeeded &= sendBuf.Encode((UInt32)0);
-
-                    succeeded &= sendBuf.Encode(requests[i].NodeId);
-                    succeeded &= sendBuf.Encode((UInt32)requests[i].PerformUpdate);
-                    succeeded &= sendBuf.Encode((UInt32)requests[i].Value.Length);
-
-                    for (int j = 0; j < requests[i].Value.Length; j++)
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        succeeded &= sendBuf.Encode(requests[i].Value[j]);
+                        return headerRes;
                     }
 
-                    succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var reqHeader = new RequestHeader()
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.HistoryUpdateRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(new NodeId(UAConst.UpdateDataDetails_Encoding_DefaultBinary));
+                        succeeded &= sendBuf.Encode((byte)1);
+                        int eoStartPos = sendBuf.Position;
+                        succeeded &= sendBuf.Encode((UInt32)0);
+
+                        succeeded &= sendBuf.Encode(requests[i].NodeId);
+                        succeeded &= sendBuf.Encode((UInt32)requests[i].PerformUpdate);
+                        succeeded &= sendBuf.Encode((UInt32)requests[i].Value.Length);
+
+                        for (int j = 0; j < requests[i].Value.Length; j++)
+                        {
+                            succeeded &= sendBuf.Encode(requests[i].Value[j]);
+                        }
+
+                        succeeded &= sendBuf.Encode((UInt32)(sendBuf.Position - eoStartPos - 4), eoStartPos);
                     }
 
-                    recvQueue.Remove(recvKey);
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.HistoryUpdateResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new uint[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (numRecv != requests.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.HistoryUpdateResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                results = new uint[numRecv];
-                for (int i = 0; i < numRecv && succeeded; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
-
-                if (numRecv != requests.Length)
-                {
-                    return StatusCode.GoodResultsMayBeIncomplete;
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2713,101 +3522,104 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.TranslateBrowsePathsToNodeIdsRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(requests[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.TranslateBrowsePathsToNodeIdsRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(requests[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.TranslateBrowsePathsToNodeIdsResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new BrowsePathResult[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (numRecv != requests.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.TranslateBrowsePathsToNodeIdsResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                results = new BrowsePathResult[numRecv];
-                for (int i = 0; i < numRecv && succeeded; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
-
-                if (numRecv != requests.Length)
-                {
-                    return StatusCode.GoodResultsMayBeIncomplete;
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2817,132 +3629,156 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.CallRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(requests[i].ObjectId);
-                    succeeded &= sendBuf.Encode(requests[i].MethodId);
-                    succeeded &= sendBuf.Encode((UInt32)requests[i].InputArguments.Length);
-                    for (int j = 0; j < requests[i].InputArguments.Length; j++)
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        succeeded &= sendBuf.VariantEncode(requests[i].InputArguments[j]);
-                    }
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
-                    {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CallResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
-
-                results = new CallMethodResult[numRecv];
-                for (int i = 0; i < numRecv && succeeded; i++)
-                {
-                    UInt32[] resultStatus;
-                    object[] outputs;
-
-                    succeeded &= recvHandler.RecvBuf.Decode(out uint status);
-
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
-                    resultStatus = new UInt32[numResults];
-                    for (int j = 0; j < numResults; j++)
+                    var reqHeader = new RequestHeader()
                     {
-                        succeeded &= recvHandler.RecvBuf.Decode(out resultStatus[j]);
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.CallRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(requests[i].ObjectId);
+                        succeeded &= sendBuf.Encode(requests[i].MethodId);
+                        succeeded &= sendBuf.Encode((UInt32)requests[i].InputArguments.Length);
+                        for (int j = 0; j < requests[i].InputArguments.Length; j++)
+                        {
+                            succeeded &= sendBuf.VariantEncode(requests[i].InputArguments[j]);
+                        }
                     }
 
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDiagnosticInfos);
-                    if (numDiagnosticInfos > 0)
+                    if (!succeeded)
                     {
-                        return StatusCode.BadTypeMismatch;
+                        return StatusCode.BadEncodingLimitsExceeded;
                     }
 
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numOutputs);
-                    outputs = new object[numOutputs];
-                    for (int j = 0; j < numResults; j++)
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
                     {
-                        succeeded &= recvHandler.RecvBuf.VariantDecode(out outputs[j]);
+                        recvNotify[recvKey] = recvEv;
                     }
 
-                    results[i] = new CallMethodResult(status, resultStatus, outputs);
-                }
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
 
-                if (numRecv != requests.Length)
-                {
-                    return StatusCode.GoodResultsMayBeIncomplete;
-                }
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
 
-                return StatusCode.Good;
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CallResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numRecv);
+
+                    results = new CallMethodResult[numRecv];
+                    for (int i = 0; i < numRecv && succeeded; i++)
+                    {
+                        UInt32[] resultStatus;
+                        object[] outputs;
+
+                        succeeded &= recvHandler.RecvBuf.Decode(out uint status);
+
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                        if (numResults == uint.MaxValue)
+                        {
+                            numResults = 0;
+                        }
+                        resultStatus = new UInt32[numResults];
+                        for (int j = 0; j < numResults; j++)
+                        {
+                            succeeded &= recvHandler.RecvBuf.Decode(out resultStatus[j]);
+                        }
+
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDiagnosticInfos);
+                        if (numDiagnosticInfos > 0)
+                        {
+                            if (numDiagnosticInfos == uint.MaxValue)
+                            {
+                                return StatusCode.BadTypeMismatch;
+                            }
+
+                            // TODO: Read DiagnosticInfo
+                            for (int j = 0; j < numDiagnosticInfos; j++)
+                            {
+                                succeeded &= recvHandler.RecvBuf.Decode(out byte mask);
+                                if (mask != 0)
+                                {
+                                    return StatusCode.BadNotImplemented;
+                                }
+                            }
+                        }
+
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numOutputs);
+                        if (numOutputs == uint.MaxValue)
+                        {
+                            numOutputs = 0;
+                        }
+                        outputs = new object[numOutputs];
+                        for (int j = 0; j < numOutputs; j++)
+                        {
+                            succeeded &= recvHandler.RecvBuf.VariantDecode(out outputs[j]);
+                        }
+
+                        results[i] = new CallMethodResult(status, resultStatus, outputs);
+                    }
+
+                    if (numRecv != requests.Length)
+                    {
+                        return StatusCode.GoodResultsMayBeIncomplete;
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -2952,98 +3788,101 @@ namespace LibUA
         {
             result = 0xFFFFFFFFu;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.CreateSubscriptionRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode(RequestedPublishingInterval);
-                succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
-                succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
-                succeeded &= sendBuf.Encode(MaxNotificationsPerPublish);
-                succeeded &= sendBuf.Encode(PublishingEnabled);
-                succeeded &= sendBuf.Encode(Priority);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CreateSubscriptionResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.CreateSubscriptionRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                succeeded &= recvHandler.RecvBuf.Decode(out result);
+                    succeeded &= sendBuf.Encode(RequestedPublishingInterval);
+                    succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
+                    succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
+                    succeeded &= sendBuf.Encode(MaxNotificationsPerPublish);
+                    succeeded &= sendBuf.Encode(PublishingEnabled);
+                    succeeded &= sendBuf.Encode(Priority);
 
-                succeeded &= recvHandler.RecvBuf.Decode(out double revisedPublishInterval);
-                succeeded &= recvHandler.RecvBuf.Decode(out uint revisedLifetimeCount);
-                succeeded &= recvHandler.RecvBuf.Decode(out uint revisedMaxKeepAliveCount);
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CreateSubscriptionResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.Decode(out result);
+
+                    succeeded &= recvHandler.RecvBuf.Decode(out double revisedPublishInterval);
+                    succeeded &= recvHandler.RecvBuf.Decode(out uint revisedLifetimeCount);
+                    succeeded &= recvHandler.RecvBuf.Decode(out uint revisedMaxKeepAliveCount);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
                 }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
 
-            lock (publishReqs)
+            lock (publishReqsLock)
             {
                 if (publishReqs.Count > 0)
                 {
@@ -3058,96 +3897,99 @@ namespace LibUA
         {
             result = 0;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.ModifySubscriptionRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode(subscriptionId);
-
-                succeeded &= sendBuf.Encode(RequestedPublishingInterval);
-                succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
-                succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
-                succeeded &= sendBuf.Encode(MaxNotificationsPerPublish);
-                succeeded &= sendBuf.Encode(PublishingEnabled);
-                succeeded &= sendBuf.Encode(Priority);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.ModifySubscriptionRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    succeeded &= sendBuf.Encode(subscriptionId);
+
+                    succeeded &= sendBuf.Encode(RequestedPublishingInterval);
+                    succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
+                    succeeded &= sendBuf.Encode((UInt32)0xFFFFFFFFu);
+                    succeeded &= sendBuf.Encode(MaxNotificationsPerPublish);
+                    succeeded &= sendBuf.Encode(PublishingEnabled);
+                    succeeded &= sendBuf.Encode(Priority);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ModifySubscriptionResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.Decode(out double revisedPublishInterval);
+                    succeeded &= recvHandler.RecvBuf.Decode(out uint revisedLifetimeCount);
+                    succeeded &= recvHandler.RecvBuf.Decode(out uint revisedMaxKeepAliveCount);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    result = recvHandler.Header.ServiceResult;
+                    return StatusCode.Good;
                 }
-
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ModifySubscriptionResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
-
-                succeeded &= recvHandler.RecvBuf.Decode(out double revisedPublishInterval);
-                succeeded &= recvHandler.RecvBuf.Decode(out uint revisedLifetimeCount);
-                succeeded &= recvHandler.RecvBuf.Decode(out uint revisedMaxKeepAliveCount);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
-
-                result = recvHandler.Header.ServiceResult;
-                return StatusCode.Good;
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -3157,95 +3999,98 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.DeleteSubscriptionsRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)subscriptionIds.Length);
-                for (int i = 0; i < subscriptionIds.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(subscriptionIds[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.DeleteSubscriptionsResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.DeleteSubscriptionsRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
-                results = new uint[numResults];
-                for (int i = 0; i < numResults; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
+                    succeeded &= sendBuf.Encode((UInt32)subscriptionIds.Length);
+                    for (int i = 0; i < subscriptionIds.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(subscriptionIds[i]);
+                    }
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
 
-                return StatusCode.Good;
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.DeleteSubscriptionsResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                    results = new uint[numResults];
+                    for (int i = 0; i < numResults; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -3255,96 +4100,99 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.SetPublishingModeRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode(PublishingEnabled);
-                succeeded &= sendBuf.Encode((UInt32)requestIds.Length);
-                for (int i = 0; i < requestIds.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode((UInt32)requestIds[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.SetPublishingModeResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.SetPublishingModeRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
-                results = new uint[numResults];
-                for (int i = 0; i < numResults; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
+                    succeeded &= sendBuf.Encode(PublishingEnabled);
+                    succeeded &= sendBuf.Encode((UInt32)requestIds.Length);
+                    for (int i = 0; i < requestIds.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode((UInt32)requestIds[i]);
+                    }
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
 
-                return StatusCode.Good;
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.SetPublishingModeResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                    results = new uint[numResults];
+                    for (int i = 0; i < numResults; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -3354,98 +4202,101 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.CreateMonitoredItemsRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)subscriptionId);
-                succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
-
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(requests[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CreateMonitoredItemsResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.CreateMonitoredItemsRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
-                results = new MonitoredItemCreateResult[numResults];
-                for (int i = 0; i < numResults; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
+                    succeeded &= sendBuf.Encode((UInt32)subscriptionId);
+                    succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(requests[i]);
+                    }
 
-                return StatusCode.Good;
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.CreateMonitoredItemsResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                    results = new MonitoredItemCreateResult[numResults];
+                    for (int i = 0; i < numResults; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -3455,98 +4306,101 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.ModifyMonitoredItemsRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)subscriptionId);
-                succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
-
-                succeeded &= sendBuf.Encode((UInt32)requests.Length);
-                for (int i = 0; i < requests.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(requests[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ModifyMonitoredItemsResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.ModifyMonitoredItemsRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
-                results = new MonitoredItemModifyResult[numResults];
-                for (int i = 0; i < numResults; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
+                    succeeded &= sendBuf.Encode((UInt32)subscriptionId);
+                    succeeded &= sendBuf.Encode((UInt32)timestampsToReturn);
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
+                    succeeded &= sendBuf.Encode((UInt32)requests.Length);
+                    for (int i = 0; i < requests.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(requests[i]);
+                    }
 
-                return StatusCode.Good;
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.ModifyMonitoredItemsResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                    results = new MonitoredItemModifyResult[numResults];
+                    for (int i = 0; i < numResults; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -3556,96 +4410,99 @@ namespace LibUA
         {
             results = null;
 
+            RecvHandler recvHandler = null;
             try
             {
                 cs.WaitOne();
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
-                }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.DeleteMonitoredItemsRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                succeeded &= sendBuf.Encode((UInt32)subscriptionId);
-                succeeded &= sendBuf.Encode((UInt32)monitorIds.Length);
-                for (int i = 0; i < monitorIds.Length; i++)
-                {
-                    succeeded &= sendBuf.Encode(monitorIds[i]);
-                }
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
-                var recvEv = new ManualResetEvent(false);
-                lock (recvNotify)
-                {
-                    recvNotify[recvKey] = recvEv;
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                bool signalled = recvEv.WaitOne(Timeout * 1000);
-
-                lock (recvNotify)
-                {
-                    recvNotify.Remove(recvKey);
-                }
-
-                if (!signalled)
-                {
-                    return StatusCode.BadRequestTimeout;
-                }
-
-                RecvHandler recvHandler = null;
-                lock (recvQueue)
-                {
-                    if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
                     {
-                        return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        return headerRes;
                     }
 
-                    recvQueue.Remove(recvKey);
-                }
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
 
-                if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.DeleteMonitoredItemsResponse))
-                {
-                    return StatusCode.BadUnknownResponse;
-                }
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.DeleteMonitoredItemsRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
 
-                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
-                results = new uint[numResults];
-                for (int i = 0; i < numResults; i++)
-                {
-                    succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-                }
+                    succeeded &= sendBuf.Encode((UInt32)subscriptionId);
+                    succeeded &= sendBuf.Encode((UInt32)monitorIds.Length);
+                    for (int i = 0; i < monitorIds.Length; i++)
+                    {
+                        succeeded &= sendBuf.Encode(monitorIds[i]);
+                    }
 
-                if (!succeeded)
-                {
-                    return StatusCode.BadDecodingError;
-                }
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
 
-                return StatusCode.Good;
+                    var recvKey = new Tuple<uint, uint>((uint)MessageType.Message, reqHeader.RequestHandle);
+                    var recvEv = new ManualResetEvent(false);
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify[recvKey] = recvEv;
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    bool signalled = recvEv.WaitOne(Timeout * 1000);
+
+                    lock (recvNotifyLock)
+                    {
+                        recvNotify.Remove(recvKey);
+                    }
+
+                    if (!signalled)
+                    {
+                        return StatusCode.BadRequestTimeout;
+                    }
+
+                    lock (recvQueueLock)
+                    {
+                        if (!recvQueue.TryGetValue(recvKey, out recvHandler))
+                        {
+                            return recvHandlerStatus == StatusCode.Good ? StatusCode.BadUnexpectedError : recvHandlerStatus;
+                        }
+
+                        recvQueue.Remove(recvKey);
+                    }
+
+                    if (!recvHandler.Type.EqualsNumeric(0, (uint)RequestCode.DeleteMonitoredItemsResponse))
+                    {
+                        return CheckServiceFaultResponse(recvHandler);
+                    }
+
+                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numResults);
+                    results = new uint[numResults];
+                    for (int i = 0; i < numResults; i++)
+                    {
+                        succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                    }
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadDecodingError;
+                    }
+
+                    return StatusCode.Good;
+                }
             }
             finally
             {
+                recvHandler?.DisposeRecvBuf();
                 cs.Release();
                 CheckPostCall();
             }
@@ -3653,99 +4510,106 @@ namespace LibUA
 
         private void ConsumeNotification(RecvHandler recvHandler)
         {
-            bool succeeded = true;
-            succeeded &= recvHandler.RecvBuf.Decode(out uint subscrId);
-            // AvailableSequenceNumbers
-            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numSeqNums);
-            for (int i = 0; i < numSeqNums; i++) { succeeded &= recvHandler.RecvBuf.Decode(out uint _); }
-
-            succeeded &= recvHandler.RecvBuf.Decode(out bool _);
-            succeeded &= recvHandler.RecvBuf.Decode(out uint _);
-
-            succeeded &= recvHandler.RecvBuf.Decode(out ulong publishTimeTick);
-            DateTimeOffset publishTime;
             try
             {
-                publishTime = DateTimeOffset.FromFileTime((long)publishTimeTick);
-            }
-            catch
-            {
-            }
+                bool succeeded = true;
+                succeeded &= recvHandler.RecvBuf.Decode(out uint subscrId);
+                // AvailableSequenceNumbers
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numSeqNums);
+                for (int i = 0; i < numSeqNums; i++) { succeeded &= recvHandler.RecvBuf.Decode(out uint _); }
 
-            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numNotificationData);
-            for (int i = 0; succeeded && i < numNotificationData; i++)
-            {
-
-                succeeded &= recvHandler.RecvBuf.Decode(out NodeId typeId);
-                succeeded &= recvHandler.RecvBuf.Decode(out byte bodyType);
+                succeeded &= recvHandler.RecvBuf.Decode(out bool _);
                 succeeded &= recvHandler.RecvBuf.Decode(out uint _);
 
-                if (bodyType != 1)
+                succeeded &= recvHandler.RecvBuf.Decode(out ulong publishTimeTick);
+                DateTimeOffset publishTime;
+                try
                 {
-                    break;
+                    publishTime = DateTimeOffset.FromFileTime((long)publishTimeTick);
+                }
+                catch
+                {
                 }
 
-                if (typeId.EqualsNumeric(0, (uint)UAConst.DataChangeNotification_Encoding_DefaultBinary))
+                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numNotificationData);
+                for (int i = 0; succeeded && i < numNotificationData; i++)
                 {
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDv);
 
-                    if (numDv > 0)
+                    succeeded &= recvHandler.RecvBuf.Decode(out NodeId typeId);
+                    succeeded &= recvHandler.RecvBuf.Decode(out byte bodyType);
+                    succeeded &= recvHandler.RecvBuf.Decode(out uint _);
+
+                    if (bodyType != 1)
                     {
-                        DataValue[] notifications = new DataValue[numDv];
-                        uint[] clientHandles = new uint[numDv];
-                        for (int j = 0; succeeded && j < numDv; j++)
-                        {
-                            succeeded &= recvHandler.RecvBuf.Decode(out clientHandles[j]);
-                            succeeded &= recvHandler.RecvBuf.Decode(out notifications[j]);
-                        }
-
-                        if (!succeeded)
-                        {
-                            break;
-                        }
-
-                        NotifyDataChangeNotifications(subscrId, clientHandles, notifications);
+                        break;
                     }
-                }
-                else if (typeId.EqualsNumeric(0, (uint)UAConst.EventNotificationList_Encoding_DefaultBinary))
-                {
-                    succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDv);
 
-                    if (numDv > 0)
+                    if (typeId.EqualsNumeric(0, (uint)UAConst.DataChangeNotification_Encoding_DefaultBinary))
                     {
-                        object[][] notifications = new object[numDv][];
-                        uint[] clientHandles = new uint[numDv];
-                        for (int j = 0; succeeded && j < numDv; j++)
-                        {
-                            succeeded &= recvHandler.RecvBuf.Decode(out clientHandles[j]);
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDv);
 
-                            succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numFields);
-                            notifications[j] = new object[numFields];
-                            for (int k = 0; succeeded && k < numFields; k++)
+                        if (numDv > 0)
+                        {
+                            DataValue[] notifications = new DataValue[numDv];
+                            uint[] clientHandles = new uint[numDv];
+                            for (int j = 0; succeeded && j < numDv; j++)
                             {
-                                succeeded &= recvHandler.RecvBuf.VariantDecode(out notifications[j][k]);
+                                succeeded &= recvHandler.RecvBuf.Decode(out clientHandles[j]);
+                                succeeded &= recvHandler.RecvBuf.Decode(out notifications[j]);
                             }
-                        }
 
-                        if (!succeeded)
+                            if (!succeeded)
+                            {
+                                break;
+                            }
+
+                            NotifyDataChangeNotifications(subscrId, clientHandles, notifications);
+                        }
+                    }
+                    else if (typeId.EqualsNumeric(0, (uint)UAConst.EventNotificationList_Encoding_DefaultBinary))
+                    {
+                        succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numDv);
+
+                        if (numDv > 0)
                         {
-                            break;
-                        }
+                            object[][] notifications = new object[numDv][];
+                            uint[] clientHandles = new uint[numDv];
+                            for (int j = 0; succeeded && j < numDv; j++)
+                            {
+                                succeeded &= recvHandler.RecvBuf.Decode(out clientHandles[j]);
 
-                        NotifyEventNotifications(subscrId, clientHandles, notifications);
+                                succeeded &= recvHandler.RecvBuf.DecodeArraySize(out uint numFields);
+                                notifications[j] = new object[numFields];
+                                for (int k = 0; succeeded && k < numFields; k++)
+                                {
+                                    succeeded &= recvHandler.RecvBuf.VariantDecode(out notifications[j][k]);
+                                }
+                            }
+
+                            if (!succeeded)
+                            {
+                                break;
+                            }
+
+                            NotifyEventNotifications(subscrId, clientHandles, notifications);
+                        }
+                    }
+                    else
+                    {
+                        break;
                     }
                 }
-                else
-                {
-                    break;
-                }
-            }
 
-            //results = new uint[numResults];
-            //for (int i = 0; i < numResults; i++)
-            //{
-            //	succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
-            //}
+                //results = new uint[numResults];
+                //for (int i = 0; i < numResults; i++)
+                //{
+                //	succeeded &= recvHandler.RecvBuf.Decode(out results[i]);
+                //}
+            }
+            finally
+            {
+                recvHandler?.DisposeRecvBuf();
+            }
         }
 
         public virtual void NotifyEventNotifications(uint subscrId, uint[] clientHandles, object[][] notifications)
@@ -3765,44 +4629,46 @@ namespace LibUA
 
             try
             {
-                var sendBuf = new MemoryBuffer(MaximumMessageSize);
-                var headerRes = EncodeMessageHeader(sendBuf, false);
-                if (headerRes != StatusCode.Good)
+                using (var sendBuf = new MemoryBuffer(MaximumMessageSize))
                 {
-                    return headerRes;
+                    var headerRes = EncodeMessageHeader(sendBuf, false);
+                    if (headerRes != StatusCode.Good)
+                    {
+                        return headerRes;
+                    }
+
+                    var reqHeader = new RequestHeader()
+                    {
+                        RequestHandle = nextRequestHandle++,
+                        Timestamp = DateTime.Now,
+                        AuthToken = config.AuthToken,
+                    };
+
+                    bool succeeded = true;
+                    succeeded &= sendBuf.Encode(new NodeId(RequestCode.PublishRequest));
+                    succeeded &= sendBuf.Encode(reqHeader);
+
+                    // SubscriptionAcknowledgements
+                    succeeded &= sendBuf.Encode((UInt32)0);
+
+                    if (!succeeded)
+                    {
+                        return StatusCode.BadEncodingLimitsExceeded;
+                    }
+
+                    lock (publishReqsLock)
+                    {
+                        publishReqs.Add(reqHeader.RequestHandle);
+                    }
+
+                    var sendRes = MessageSecureAndSend(config, sendBuf);
+                    if (sendRes != StatusCode.Good)
+                    {
+                        return sendRes;
+                    }
+
+                    return StatusCode.Good;
                 }
-
-                var reqHeader = new RequestHeader()
-                {
-                    RequestHandle = nextRequestHandle++,
-                    Timestamp = DateTime.Now,
-                    AuthToken = config.AuthToken,
-                };
-
-                bool succeeded = true;
-                succeeded &= sendBuf.Encode(new NodeId(RequestCode.PublishRequest));
-                succeeded &= sendBuf.Encode(reqHeader);
-
-                // SubscriptionAcknowledgements
-                succeeded &= sendBuf.Encode((UInt32)0);
-
-                if (!succeeded)
-                {
-                    return StatusCode.BadEncodingLimitsExceeded;
-                }
-
-                lock (publishReqs)
-                {
-                    publishReqs.Add(reqHeader.RequestHandle);
-                }
-
-                var sendRes = MessageSecureAndSend(config, sendBuf);
-                if (sendRes != StatusCode.Good)
-                {
-                    return sendRes;
-                }
-
-                return StatusCode.Good;
             }
             finally
             {

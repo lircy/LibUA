@@ -25,6 +25,13 @@ namespace LibUA
             private readonly List<NetDispatcherBase> dispatchers = null;
             private readonly Lock dispatchersLock = new();
 
+            private void WithDispatchersLock(Action action)
+            {
+                dispatchersLock.Enter();
+                try { action(); }
+                finally { dispatchersLock.Exit(); }
+            }
+
             public Master(Application App, int Port, int Timeout, int Backlog, int MaxClients, ILogger logger, int MaximumMessageSize = 1 << 20)
             {
                 this.App = App;
@@ -127,15 +134,7 @@ namespace LibUA
                     {
                         handler.NoDelay = true;
 
-                        dispatchersLock.Enter();
-                        try
-                        {
-                            dispatchers.Add(new NetDispatcher(this, App, handler, logger));
-                        }
-                        finally
-                        {
-                            dispatchersLock.Exit();
-                        }
+                        WithDispatchersLock(() => dispatchers.Add(new NetDispatcher(this, App, handler, logger)));
                     }
                     else
                     {
@@ -155,19 +154,14 @@ namespace LibUA
 
             internal void RemoveDispatcher(NetDispatcherBase netDispatcher)
             {
-                dispatchersLock.Enter();
-                try
+                WithDispatchersLock(() =>
                 {
                     if (dispatchers.Contains(netDispatcher))
                     {
                         dispatchers.Remove(netDispatcher);
                         listenerAvailable.Release();
                     }
-                }
-                finally
-                {
-                    dispatchersLock.Exit();
-                }
+                });
             }
         }
 
@@ -252,10 +246,12 @@ namespace LibUA
             protected UInt32 nextSubscriptionID = 1;
             protected Queue<RequestHeader> pendingNotificationRequests = null;
             protected Dictionary<uint, Queue<uint>> pendingSubscriptionAcknowledgements = null;
+            protected readonly object pendingAcksLock = new();
             //protected Dictionary<uint, Application.MonitorDispatcherConfiguration> monitorMap = null;
             //protected List<Application.MonitorDispatcherConfiguration> monitorList = null;
 
             protected Dictionary<UInt32, Subscription> subscriptionMap = null;
+            protected readonly object subscriptionMapLock = new();
 
             protected Stack<int> availableContinuationPoints = null;
             protected Dictionary<int, ContinuationPointBrowse> continuationBrowse = null;
@@ -383,6 +379,11 @@ namespace LibUA
                         {
                             csDispatching.Exit();
                         }
+
+                        if (threadAbort)
+                        {
+                            break;
+                        }
                     }
 
                     try
@@ -490,11 +491,7 @@ namespace LibUA
                         else
                         {
                             int newSize = recvAccumSize - consumedSize;
-
-                            var newRecvBuffer = new byte[maximumMessageSize];
-                            Array.Copy(recvBuffer, consumedSize, newRecvBuffer, 0, newSize);
-                            recvBuffer = newRecvBuffer;
-
+                            Array.Copy(recvBuffer, consumedSize, recvBuffer, 0, newSize);
                             recvAccumSize = newSize;
                         }
 
@@ -536,7 +533,10 @@ namespace LibUA
                 {
                     // Disconnected
                 }
-
+                catch (ObjectDisposedException)
+                {
+                    // Disconnected
+                }
                 server.RemoveDispatcher(this);
 
                 //foreach (var cfg in monitorMap.Values)
@@ -567,6 +567,15 @@ namespace LibUA
                 if (thread != null)
                 {
                     threadAbort = true;
+
+                    try
+                    {
+                        socket?.Shutdown(SocketShutdown.Both);
+                    }
+                    catch
+                    {
+                    }
+                    socket?.Close();
 
                     thread.Join();
                     thread = null;

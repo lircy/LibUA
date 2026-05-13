@@ -1,4 +1,5 @@
-﻿using System;
+﻿using LibUA.ValueTypes;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
@@ -21,7 +22,9 @@ namespace LibUA
                 "http://opcfoundation.org/UA/SecurityPolicy#None",
                 "http://opcfoundation.org/UA/SecurityPolicy#Basic256",
                 "http://opcfoundation.org/UA/SecurityPolicy#Basic128Rsa15",
-                "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256"
+                "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
+                "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep",
+                "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss"
             };
 
             public const string TransportProfileBinary = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
@@ -29,6 +32,8 @@ namespace LibUA
             public const string SignatureAlgorithmSha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
             public const string SignatureAlgorithmRsa15 = "http://www.w3.org/2001/04/xmlenc#rsa-1_5";
             public const string SignatureAlgorithmRsaOaep = "http://www.w3.org/2001/04/xmlenc#rsa-oaep";
+            public const string SignatureAlgorithmRsaOaep256 = "http://opcfoundation.org/UA/security/rsa-oaep-sha2-256";
+            public const string SignatureAlgorithmRsaPss256 = "http://opcfoundation.org/UA/security/rsa-pss-sha2-256";
 
             public const string IdentityTokenAnonymous = "anonymous";
         }
@@ -5486,7 +5491,9 @@ namespace LibUA
             None,
             Basic256,
             Basic128Rsa15,
-            Basic256Sha256
+            Basic256Sha256,
+            Aes128_Sha256_RsaOaep,
+            Aes256_Sha256_RsaPss,
         }
 
         [Flags]
@@ -5599,7 +5606,7 @@ namespace LibUA
             ByteString = 5,
         }
 
-        public enum NodeIdNetType
+        public enum NodeIdNetType : byte
         {
             //TwoByte,
             //FourByte,
@@ -5614,7 +5621,7 @@ namespace LibUA
         {
             Read = 0x1,
             Write = 0x2,
-            EraseExisiting = 0x4,
+            EraseExisting = 0x4,
             Append = 0x8,
         }
 
@@ -5785,7 +5792,7 @@ namespace LibUA
 
             public override string ToString()
             {
-                return string.Format("[{0}] {1}", NamespaceIndex, Name ?? "");
+                return string.Format("{0},\"{1}\"", NamespaceIndex, Name ?? "");
             }
         }
 
@@ -5808,21 +5815,184 @@ namespace LibUA
 
             public override string ToString()
             {
-                return string.Format("[{0}] {1}", Locale, Text);
+                return string.Format("\"{0}\",\"{1}\"", Locale, Text);
             }
         }
 
         public class ExtensionObject
         {
+            private static readonly ConcurrentDictionary<Type, Func<MemoryBuffer, NodeId>> _objectEncoders = new ConcurrentDictionary<Type, Func<MemoryBuffer, NodeId>>();
+            private static readonly ConcurrentDictionary<NodeId, Func<MemoryBuffer, object>> _objectDecoders = new ConcurrentDictionary<NodeId, Func<MemoryBuffer, object>>();
+            public static void RegisterEncoder<TObject>(Func<MemoryBuffer, NodeId> encoder)
+            {
+                _objectEncoders[typeof(TObject)] = encoder;
+            }
+
+            public static void RegisterDecoder<TObject>(NodeId TypeId, Func<MemoryBuffer, TObject> decoder) where TObject : class
+            {
+                _objectDecoders[TypeId] = decoder;
+            }
+
             public NodeId TypeId { get; set; }
             public byte[] Body { get; set; }
+
+            public object Payload { get; set; }
+
+            public bool TryEncodeByteString(int BufferCapacity)
+            {
+                if (TypeId != null && Body != null)
+                {
+                    return true;
+                }
+                
+                TypeId = null;
+                if (Payload != null)
+                {
+                    using (var buffer = new MemoryBuffer(BufferCapacity))
+                    {
+                        UAConst payloadType = 0;
+
+                        if (_objectEncoders.TryGetValue(Payload.GetType(), out var encoder))
+                        {
+                            TypeId = encoder(buffer);
+                            if (TypeId == null)
+                            {
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            switch (Payload)
+                            {
+                                case ObjectAttributes oa:
+                                    payloadType = UAConst.ObjectAttributes_Encoding_DefaultBinary;
+                                    if (!buffer.Encode(oa)) { return false; }
+                                    break;
+                                case ObjectTypeAttributes ota:
+                                    payloadType = UAConst.ObjectTypeAttributes_Encoding_DefaultBinary;
+                                    if (!buffer.Encode(ota)) { return false; }
+                                    break;
+                                case VariableAttributes va:
+                                    payloadType = UAConst.VariableAttributes_Encoding_DefaultBinary;
+                                    if (!buffer.Encode(va)) { return false; }
+                                    break;
+                                case VariableTypeAttributes vta:
+                                    payloadType = UAConst.VariableTypeAttributes_Encoding_DefaultBinary;
+                                    if (!buffer.Encode(vta)) { return false; }
+                                    break;
+                                case Argument arg:
+                                    payloadType = UAConst.Argument_Encoding_DefaultBinary;
+                                    if (!buffer.Encode(arg)) { return false; }
+                                    break;
+                                case EUInformation eui:
+                                    payloadType = UAConst.EUInformation;
+                                    if (!buffer.Encode(eui)) { return false; }
+                                    break;
+                                case OpcRange range:
+                                    payloadType = UAConst.Range_Encoding_DefaultBinary;
+                                    if (!buffer.Encode(range)) { return false; }
+                                    break;
+                                default:
+                                    break;
+                            }
+
+                            if (payloadType != 0)
+                            {
+                                TypeId = new NodeId(payloadType);
+                            }
+                        }
+
+                        if (TypeId != null)
+                        {
+                            Body = new byte[buffer.Position];
+                            Array.Copy(buffer.Buffer, Body, Body.Length);
+                            return true;
+                        }
+
+                        return false;
+                    }
+                }
+
+                return false;
+            }
+
+            public bool TryDecodeByteString()
+            {
+                var tmp = new MemoryBuffer(Body);
+
+                if (_objectDecoders.TryGetValue(TypeId, out var decoder))
+                {
+                    Payload = decoder(tmp);
+                    if (Payload != null)
+                    {
+                        return true;
+                    }
+                }
+
+                switch (TypeId.NumericIdentifier)
+                {
+                    case (uint)UAConst.ObjectAttributes_Encoding_DefaultBinary:
+                        ObjectAttributes oa;
+                        if (!tmp.Decode(out oa)) { return false; }
+                        Payload = oa;
+                        break;
+                    case (uint)UAConst.ObjectTypeAttributes_Encoding_DefaultBinary:
+                        ObjectTypeAttributes ota;
+                        if (!tmp.Decode(out ota)) { return false; }
+                        Payload = ota;
+                        break;
+                    case (uint)UAConst.VariableAttributes_Encoding_DefaultBinary:
+                        VariableAttributes va;
+                        if (!tmp.Decode(out va)) { return false; }
+                        Payload = va;
+                        break;
+                    case (uint)UAConst.VariableTypeAttributes_Encoding_DefaultBinary:
+                        VariableTypeAttributes vta;
+                        if (!tmp.Decode(out vta)) { return false; }
+                        Payload = vta;
+                        break;
+                    case (uint)UAConst.Argument_Encoding_DefaultBinary:
+                        Argument arg;
+                        if (!tmp.Decode(out arg)) { return false; }
+                        Payload = arg;
+                        break;
+                    case (uint)UAConst.EUInformation:
+                        EUInformation eui;
+                        if (!tmp.Decode(out eui)) { return false; }
+                        Payload = eui;
+                        break;
+                    case (uint)UAConst.Range_Encoding_DefaultBinary:
+                        OpcRange range;
+                        if (!tmp.Decode(out range)) { return false; }
+                        Payload = range;
+                        break;
+                    default:
+                        break;
+                }
+
+                return Payload != null;
+            }
+        }
+
+        public class ExtensionObject<TPayload> : ExtensionObject
+        {
+            public TPayload Value
+            {
+                get
+                {
+                    if (Payload != null && Payload is TPayload tPayload)
+                        return tPayload;
+                    return default;
+                }
+                set => Payload = value;
+            }
         }
 
         public class DataValue
         {
-            public object Value { get; protected set; }
-            public uint? StatusCode { get; protected set; }
-            public DateTime? SourceTimestamp { get; protected set; }
+            public object Value { get; set; }
+            public uint? StatusCode { get; set; }
+            public DateTime? SourceTimestamp { get; set; }
             public DateTime? ServerTimestamp { get; set; }
 
             public DataValue(object Value = null, uint? StatusCode = null, DateTime? SourceTimestamp = null, DateTime? ServerTimestamp = null)
@@ -5912,6 +6082,16 @@ namespace LibUA
             public LiteralOperand(object Value)
             {
                 this.Value = Value;
+            }
+        }
+
+        public class ElementOperand : FilterOperand
+        {
+            public UInt32 Index { get; protected set; }
+
+            public ElementOperand(UInt32 index)
+            {
+                this.Index = index;
             }
         }
 
@@ -6311,6 +6491,30 @@ namespace LibUA
         //	}
         //}
 
+        public class AddNodesItem
+        {
+            public NodeId ParentNodeId { get; set; }
+            public NodeId ReferenceTypeId { get; set; }
+            public NodeId RequestedNewNodeId { get; set; }
+            public QualifiedName BrowseName { get; set; }
+            public NodeClass NodeClass { get; set; }
+            public ExtensionObject NodeAttributes { get; set; }
+            public NodeId TypeDefinition { get; set; }
+        }
+
+        public class AddNodesResult
+        {
+            public StatusCode StatusCode { get; }
+
+            public NodeId AddedNodeId { get; }
+
+            public AddNodesResult(StatusCode statusCode, NodeId addedNodeId)
+            {
+                StatusCode = statusCode;
+                AddedNodeId = addedNodeId;
+            }
+        }
+
         public struct BrowsePathTarget
         {
             public NodeId Target;
@@ -6433,6 +6637,169 @@ namespace LibUA
                 this.NodeClass = NodeClass;
                 this.TypeDefinition = TypeDefinition;
             }
+        }
+
+        public class ObjectAttributes
+        {
+            public NodeAttributesMask SpecifiedAttributes { get; set; }
+            public LocalizedText DisplayName { get; set; }
+            public LocalizedText Description { get; set; }
+            public uint WriteMask { get; set; }
+            public uint UserWriteMask { get; set; }
+            public byte EventNotifier { get; set; }
+
+            public ObjectAttributes()
+            {
+                SpecifiedAttributes = NodeAttributesMask.DisplayName
+                                            | NodeAttributesMask.Description
+                                            | NodeAttributesMask.WriteMask
+                                            | NodeAttributesMask.UserWriteMask
+                                            | NodeAttributesMask.EventNotifier;
+            }
+        }
+
+        public class ObjectTypeAttributes
+        {
+            public NodeAttributesMask SpecifiedAttributes { get; set; }
+            public LocalizedText DisplayName { get; set; }
+            public LocalizedText Description { get; set; }
+            public uint WriteMask { get; set; }
+            public uint UserWriteMask { get; set; }
+            public bool IsAbstract { get; set; }
+
+            public ObjectTypeAttributes()
+            {
+                SpecifiedAttributes = NodeAttributesMask.DisplayName
+                                            | NodeAttributesMask.Description
+                                            | NodeAttributesMask.WriteMask
+                                            | NodeAttributesMask.UserWriteMask
+                                            | NodeAttributesMask.IsAbstract;
+            }
+        }
+
+        public class VariableAttributes
+        {
+            public NodeAttributesMask SpecifiedAttributes { get; set; }
+            public LocalizedText DisplayName { get; set; }
+            public LocalizedText Description { get; set; }
+            public uint WriteMask { get; set; }
+            public uint UserWriteMask { get; set; }
+            public object Value { get; set; }
+            public NodeId DataType { get; set; }
+            public int ValueRank { get; set; }
+            public uint[] ArrayDimensions { get; set; }
+            public byte AccessLevel { get; set; }
+            public byte UserAccessLevel { get; set; }
+            public double MinimumSamplingInterval { get; set; }
+            public bool Historizing { get; set; }
+
+            public VariableAttributes()
+            {
+                SpecifiedAttributes = NodeAttributesMask.DisplayName
+                    | NodeAttributesMask.Description
+                    | NodeAttributesMask.WriteMask
+                    | NodeAttributesMask.UserWriteMask
+                    | NodeAttributesMask.Value
+                    | NodeAttributesMask.DataType
+                    | NodeAttributesMask.ValueRank
+                    | NodeAttributesMask.ArrayDimensions
+                    | NodeAttributesMask.AccessLevel
+                    | NodeAttributesMask.UserAccessLevel
+                    | NodeAttributesMask.MinimumSamplingInterval
+                    | NodeAttributesMask.Historizing;
+
+                Description = new LocalizedText("");
+                DisplayName = new LocalizedText("");
+                WriteMask = 0;
+                UserWriteMask = 0;
+                Value = 0;
+                DataType = new NodeId(0, 0);
+                ValueRank = 0;
+                ArrayDimensions = new uint[0];
+                AccessLevel = 0;
+                UserAccessLevel = 0;
+                MinimumSamplingInterval = 0;
+                Historizing = false;
+            }
+        }
+
+        public class VariableTypeAttributes
+        {
+            public NodeAttributesMask SpecifiedAttributes { get; set; }
+            public LocalizedText DisplayName { get; set; }
+            public LocalizedText Description { get; set; }
+            public uint WriteMask { get; set; }
+            public uint UserWriteMask { get; set; }
+            public object Value { get; set; }
+            public NodeId DataType { get; set; }
+            public int ValueRank { get; set; }
+            public uint[] ArrayDimensions { get; set; }
+            public bool IsAbstract { get; set; }
+
+            public VariableTypeAttributes()
+            {
+                // 2112
+                SpecifiedAttributes = NodeAttributesMask.DisplayName
+                    | NodeAttributesMask.Description
+                    | NodeAttributesMask.WriteMask
+                    | NodeAttributesMask.UserWriteMask
+                    | NodeAttributesMask.Value
+                    | NodeAttributesMask.DataType
+                    | NodeAttributesMask.ValueRank
+                    | NodeAttributesMask.ArrayDimensions
+                    | NodeAttributesMask.IsAbstract;
+
+                Description = new LocalizedText("");
+                DisplayName = new LocalizedText("");
+                WriteMask = 0;
+                UserWriteMask = 0;
+                Value = 0;
+                DataType = new NodeId(0, 0);
+                ValueRank = 0;
+                ArrayDimensions = new uint[0];
+                IsAbstract = false;
+            }
+
+        }
+
+        public class DeleteNodesItem
+        {
+            public NodeId NodeId { get; }
+            public Boolean DeleteTargetReferences { get; }
+
+            public DeleteNodesItem(NodeId nodeId, bool deleteTargetReferences)
+            {
+                NodeId = nodeId;
+                DeleteTargetReferences = deleteTargetReferences;
+            }
+        }
+
+        public class AddReferencesItem
+        {
+            public NodeId SourceNodeId { get; set; }
+
+            public NodeId ReferenceTypeId { get; set; }
+
+            public Boolean IsForward { get; set; }
+
+            public String TargetServerUri { get; set; }
+
+            public NodeId TargetNodeId { get; set; }
+
+            public NodeClass TargetNodeClass { get; set; }
+        }
+
+        public class DeleteReferencesItem
+        {
+            public NodeId SourceNodeId { get; set; }
+
+            public NodeId ReferenceTypeId { get; set; }
+
+            public Boolean IsForward { get; set; }
+
+            public NodeId TargetNodeId { get; set; }
+
+            public Boolean DeleteBidirectional { get; set; }
         }
 
         public class ApplicationDescription
@@ -6699,12 +7066,6 @@ namespace LibUA
             }
         }
 
-        public class SubscriptionAcknowledgement
-        {
-            public uint SubscriptionId { get; set; }
-            public uint SequenceNumber { get; set; }
-        }
-
         public class RequestHeader
         {
             public NodeId AuthToken { get; set; }
@@ -6837,6 +7198,7 @@ namespace LibUA
             public TimeSpan PublishInterval, PublishKeepAliveInterval;
 
             public Dictionary<UInt32, MonitoredItem> MonitoredItems;
+            private readonly object monitoredItemsLock = new object();
 
             public Subscription()
             {
@@ -6858,6 +7220,8 @@ namespace LibUA
                 ChangeNotification = ChangeNotificationType.None;
                 MonitoredItems = new Dictionary<uint, MonitoredItem>();
             }
+
+            public object MonitoredItemsSyncRoot => monitoredItemsLock;
         }
 
         public class SLSequence
@@ -6924,6 +7288,24 @@ namespace LibUA
 
             public Keyset[] LocalKeysets { get; set; }
             public Keyset[] RemoteKeysets { get; set; }
+        }
+
+        public class Argument
+        {
+            public string Name { get; }
+            public NodeId DataType { get; }
+            public int ValueRank { get; }
+            public uint[] ArrayDimensions { get; }
+            public LocalizedText Description { get; }
+
+            public Argument(string name, NodeId dataType, int valueRank, uint[] arrayDimensions, LocalizedText description)
+            {
+                Name = name;
+                DataType = dataType;
+                ValueRank = valueRank;
+                ArrayDimensions = arrayDimensions;
+                Description = description;
+            }
         }
     }
 }

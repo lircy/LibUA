@@ -1255,10 +1255,23 @@ namespace LibUA
                 hasServerTimestamp = true;
             }
 
+            // SourcePicoseconds (bit 4) and ServerPicoseconds (bit 5) - must be consumed
+            // to keep stream aligned even though we discard the value
+            if ((mask & 0x10) != 0)
+            {
+                if (!mem.Decode(out ushort _)) { return false; }
+            }
+
+            if ((mask & 0x20) != 0)
+            {
+                if (!mem.Decode(out ushort _)) { return false; }
+            }
+
             try
             {
                 dv.Value = Value;
-                dv.StatusCode = hasStatusCode ? statusCode : null;
+                // Per OPC UA spec, StatusCode defaults to Good (0) when not explicitly provided
+                dv.StatusCode = hasStatusCode ? statusCode : (uint?)StatusCode.Good;
                 dv.SourceTimestamp = hasSourceTimestamp ? DateTime.FromFileTimeUtc(sourceTimestamp) : null;
                 dv.ServerTimestamp = hasServerTimestamp ? DateTime.FromFileTimeUtc(serverTimestamp) : null;
             }

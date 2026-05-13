@@ -505,9 +505,9 @@ namespace LibUA
             /// <param name="session"></param>
             /// <param name="nodesToRegister"></param>
             /// <returns>(StatusCode, NodeId[])</returns>
-            public virtual (StatusCode, NodeId[]) HandleRegisterNodesRequest(object session, NodeId[] nodesToRegister)
+            public virtual Tuple<StatusCode, NodeId[]> HandleRegisterNodesRequest(object session, NodeId[] nodesToRegister)
             {
-                return (StatusCode.Good, nodesToRegister);
+                return Tuple.Create(StatusCode.Good, nodesToRegister);
             }
 
             /// <summary>

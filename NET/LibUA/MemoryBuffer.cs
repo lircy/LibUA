@@ -1,10 +1,11 @@
 ﻿using System;
+using System.Buffers;
 
 namespace LibUA
 {
     namespace Core
     {
-        public class MemoryBuffer
+        public class MemoryBuffer : IDisposable
         {
             public bool IsReadOnly { get; protected set; }
 
@@ -28,6 +29,8 @@ namespace LibUA
             public bool IsFixedCapacity { get; protected set; }
 
             public byte[] Buffer { get; protected set; }
+
+            public const uint MaxArraySize = 0x00FFFFFF;
 
             public ArraySegment<byte> AsArraySegmentToPosition()
             {
@@ -97,14 +100,49 @@ namespace LibUA
                 }
             }
 
+            private readonly bool isRented;
+            
             public MemoryBuffer(int Size)
             {
                 Position = 0;
                 IsReadOnly = false;
                 IsFixedCapacity = true;
 
-                Buffer = new byte[Size];
+                Buffer = ArrayPool<byte>.Shared.Rent(Size);
                 Capacity = Allocated = Size;
+                isRented = true;
+            }
+
+            private bool disposed;
+
+            public void Dispose()
+            {
+                if (!isRented)
+                {
+                    return;
+                }
+
+                Dispose(true);
+                GC.SuppressFinalize(this);
+            }
+
+            protected virtual void Dispose(bool disposing)
+            {
+                if (!disposed)
+                {
+                    if (disposing)
+                    {
+                        // Return the array back to the pool
+                        ArrayPool<byte>.Shared.Return(Buffer);
+                    }
+
+                    disposed = true;
+                }
+            }
+
+            ~MemoryBuffer()
+            {
+                Dispose(false);
             }
 
             public bool EnsureAvailable(int Length, bool readOnly)
@@ -213,41 +251,6 @@ namespace LibUA
                 if (!EnsureAvailable(Size, true)) { return false; }
 
                 Array.Copy(Buffer, Position, Dest, 0, Size);
-                Position += Size;
-
-                return true;
-            }
-
-            public bool Prepend(byte[] Add, int Size)
-            {
-                if (Add == null || Size > Add.Length)
-                {
-                    return false;
-                }
-
-                if (Size == 0)
-                {
-                    return true;
-                }
-
-                if (!EnsureAvailable(Size, false))
-                {
-                    return false;
-                }
-
-                var tmp = new byte[Position];
-                if (Position > 0)
-                {
-                    Array.Copy(Buffer, tmp, Position);
-                }
-
-                Array.Copy(Add, Buffer, Size);
-
-                if (Position > 0)
-                {
-                    Array.Copy(tmp, 0, Buffer, Size, Position);
-                }
-
                 Position += Size;
 
                 return true;
@@ -395,10 +398,15 @@ namespace LibUA
                     return false;
                 }
 
-                // Array length of -1 == no array encoded
                 if (v == 0xFFFFFFFFu)
                 {
                     v = 0;
+                    return true;
+                }
+
+                if (v > MaxArraySize)
+                {
+                    return false;
                 }
 
                 return true;
@@ -647,9 +655,7 @@ namespace LibUA
                 {
                     if (!Decode(out int arrLen)) { return false; }
                     if (arrLen < 0) { return false; }
-
                     Type type = Coding.GetNetType((VariantType)(mask & 0x3F));
-
                     var arr = Array.CreateInstance(type, arrLen);
                     for (int i = 0; i < arrLen; i++)
                     {
@@ -726,7 +732,7 @@ namespace LibUA
 
                 switch (mask & 0x3F)
                 {
-                    case (int)VariantType.Null:
+                    case (int)VariantType.Null: { return true; }
                     case (int)VariantType.Boolean: { if (!Decode(out bool v)) { return false; } obj = v; return true; ; }
                     case (int)VariantType.SByte: { if (!Decode(out sbyte v)) { return false; } obj = v; return true; ; }
                     case (int)VariantType.Byte: { if (!Decode(out byte v)) { return false; } obj = v; return true; ; }
@@ -759,21 +765,21 @@ namespace LibUA
 
             public MemoryBuffer Duplicate()
             {
-                var mb = new MemoryBuffer(Capacity);
-
-                mb.Append(Buffer, Capacity);
+                var mb = new MemoryBuffer(new byte[Capacity], Capacity);
+                mb.IsReadOnly = false;
+                mb.IsFixedCapacity = true;
+                Array.Copy(Buffer, 0, mb.Buffer, 0, Capacity);
                 mb.Position = Position;
-
                 return mb;
             }
 
             public MemoryBuffer Duplicate(int TargetCapacity)
             {
-                var mb = new MemoryBuffer(TargetCapacity);
-
-                mb.Append(Buffer, TargetCapacity);
+                var mb = new MemoryBuffer(new byte[TargetCapacity], TargetCapacity);
+                mb.IsReadOnly = false;
+                mb.IsFixedCapacity = true;
+                Array.Copy(Buffer, 0, mb.Buffer, 0, Math.Min(Capacity, TargetCapacity));
                 mb.Position = Position;
-
                 return mb;
             }
         }

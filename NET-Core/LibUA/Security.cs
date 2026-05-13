@@ -731,6 +731,15 @@ namespace LibUA
             var digest = hash.ComputeHash(data.Array, data.Offset, data.Count);
             var padding = SigPaddingForSecurityPolicy(policy);
 
+            // RSACryptoServiceProvider (CAPI) does not support PSS padding
+            if (policy == SecurityPolicy.Aes256_Sha256_RsaPss && privProvider is RSACryptoServiceProvider && OperatingSystem.IsWindows())
+            {
+                var rsaParams = privProvider.ExportParameters(true);
+                using var rsaCng = new RSACng();
+                rsaCng.ImportParameters(rsaParams);
+                return rsaCng.SignHash(digest, HashStrForSecurityPolicy(policy), padding);
+            }
+
             byte[] signature = privProvider.SignHash(digest, HashStrForSecurityPolicy(policy), padding);
             return signature;
         }
@@ -797,6 +806,15 @@ namespace LibUA
         {
             var rsa = cert.PublicKey.GetRSAPublicKey();
 
+            // RSACryptoServiceProvider (CAPI) does not support PSS verification
+            if (padding == RSASignaturePadding.Pss && rsa is RSACryptoServiceProvider && OperatingSystem.IsWindows())
+            {
+                var rsaParams = rsa.ExportParameters(false);
+                using var rsaCng = new RSACng();
+                rsaCng.ImportParameters(rsaParams);
+                rsa = rsaCng;
+            }
+
             var digest = hashAlg.ComputeHash(data.Array, data.Offset, data.Count);
 
             return rsa.VerifyHash(digest, signature, hashName, padding);
@@ -805,6 +823,16 @@ namespace LibUA
         public static byte[] Encrypt(ArraySegment<byte> data, X509Certificate2 cert, RSAEncryptionPadding padding)
         {
             var rsa = cert.PublicKey.GetRSAPublicKey();
+
+            // RSACryptoServiceProvider (CAPI) does not support OAEP-SHA256
+            if (padding == RSAEncryptionPadding.OaepSHA256 && rsa is RSACryptoServiceProvider && OperatingSystem.IsWindows())
+            {
+                var rsaParams = rsa.ExportParameters(false);
+                using var rsaCng = new RSACng();
+                rsaCng.ImportParameters(rsaParams);
+                rsa = rsaCng;
+            }
+
             int inputBlockSize = GetPlainBlockSize(cert, padding);
 
             if (data.Count % inputBlockSize != 0)
@@ -827,6 +855,15 @@ namespace LibUA
 
         public static byte[] Decrypt(ArraySegment<byte> data, X509Certificate2 cert, RSA rsaPrivate, RSAEncryptionPadding padding)
         {
+            // RSACryptoServiceProvider (CAPI) does not support OAEP-SHA256, use RSACng instead
+            if (padding == RSAEncryptionPadding.OaepSHA256 && rsaPrivate is RSACryptoServiceProvider && OperatingSystem.IsWindows())
+            {
+                var rsaParams = rsaPrivate.ExportParameters(true);
+                using var rsaCng = new RSACng();
+                rsaCng.ImportParameters(rsaParams);
+                return Decrypt(data, cert, rsaCng, padding);
+            }
+
             int cipherBlockSize = GetCipherTextBlockSize(cert);
             int plainSize = data.Count / cipherBlockSize;
             int blockSize = GetPlainBlockSize(cert, padding);

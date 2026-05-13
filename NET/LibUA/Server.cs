@@ -536,6 +536,10 @@ namespace LibUA
                 {
                     // Disconnected
                 }
+                catch(ObjectDisposedException)
+                {
+                    // Disconnected
+                }
 
                 server.RemoveDispatcher(this);
 
@@ -567,7 +571,14 @@ namespace LibUA
                 if (thread != null)
                 {
                     threadAbort = true;
-
+                    try
+                    {
+                        socket?.Shutdown(SocketShutdown.Both);
+                    }
+                    catch
+                    {
+                    }
+                    socket?.Close();
                     thread.Join();
                     thread = null;
                 }

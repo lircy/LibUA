@@ -30,6 +30,8 @@ namespace LibUA
 
             public byte[] Buffer { get; protected set; }
 
+            public const uint MaxArraySize = 0x00FFFFFF;
+
             public ArraySegment<byte> AsArraySegmentToPosition()
             {
                 return new ArraySegment<byte>(Buffer, 0, Position);
@@ -98,7 +100,8 @@ namespace LibUA
                 }
             }
 
-            private bool isRented;
+            private readonly bool isRented;
+            
             public MemoryBuffer(int Size)
             {
                 Position = 0;
@@ -115,7 +118,9 @@ namespace LibUA
             public void Dispose()
             {
                 if (!isRented)
+                {
                     return;
+                }
 
                 Dispose(true);
                 GC.SuppressFinalize(this);
@@ -393,10 +398,15 @@ namespace LibUA
                     return false;
                 }
 
-                // Array length of -1 == no array encoded
                 if (v == 0xFFFFFFFFu)
                 {
                     v = 0;
+                    return true;
+                }
+
+                if (v > MaxArraySize)
+                {
+                    return false;
                 }
 
                 return true;
@@ -756,21 +766,21 @@ namespace LibUA
 
             public MemoryBuffer Duplicate()
             {
-                var mb = new MemoryBuffer(Capacity);
-
-                mb.Append(Buffer, Capacity);
+                var mb = new MemoryBuffer(new byte[Capacity], Capacity);
+                mb.IsReadOnly = false;
+                mb.IsFixedCapacity = true;
+                Array.Copy(Buffer, 0, mb.Buffer, 0, Capacity);
                 mb.Position = Position;
-
                 return mb;
             }
 
             public MemoryBuffer Duplicate(int TargetCapacity)
             {
-                var mb = new MemoryBuffer(TargetCapacity);
-
-                mb.Append(Buffer, TargetCapacity);
+                var mb = new MemoryBuffer(new byte[TargetCapacity], TargetCapacity);
+                mb.IsReadOnly = false;
+                mb.IsFixedCapacity = true;
+                Array.Copy(Buffer, 0, mb.Buffer, 0, Math.Min(Capacity, TargetCapacity));
                 mb.Position = Position;
-
                 return mb;
             }
         }

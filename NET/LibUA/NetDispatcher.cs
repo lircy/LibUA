@@ -130,6 +130,11 @@ namespace LibUA
                     while (mi.QueueEvent.TryPeek(out EventNotification ev))
                     {
                         var fields = MatchFilterClauses(mi.FilterSelectClauses, ev);
+                        if (fields == null)
+                        {
+                            mi.QueueEvent.TryDequeue(out ev);
+                            continue;
+                        }
 
                         int sizeRequired = 4 + 4;
                         for (int i = 0; i < fields.Length; i++)
@@ -889,7 +894,10 @@ namespace LibUA
                         return ErrorInternal;
                     }
 
-                    if (userTokenAlgorithm != Types.SignatureAlgorithmSha256 && userTokenAlgorithm != Types.SignatureAlgorithmSha1)
+                    if (userTokenAlgorithm != Types.SignatureAlgorithmSha256 &&
+                        userTokenAlgorithm != Types.SignatureAlgorithmSha1 &&
+                        userTokenAlgorithm != Types.SignatureAlgorithmRsaOaep256 &&
+                        userTokenAlgorithm != Types.SignatureAlgorithmRsaPss256)
                     {
                         logger?.Log(LogLevel.Error,
                             "{LoggerID}: User token signature algorithm {userTokenAlgorithm} is not supported",
@@ -926,7 +934,9 @@ namespace LibUA
                     }
 
                     if (clientSignatureAlgorithm != Types.SignatureAlgorithmSha1 &&
-                        clientSignatureAlgorithm != Types.SignatureAlgorithmSha256)
+                        clientSignatureAlgorithm != Types.SignatureAlgorithmSha256 &&
+                        clientSignatureAlgorithm != Types.SignatureAlgorithmRsaOaep256 &&
+                        clientSignatureAlgorithm != Types.SignatureAlgorithmRsaPss256)
                     {
                         logger?.Log(LogLevel.Error, "{LoggerID}: Client signature algorithm {clientSignatureAlgorithm} is not supported", LoggerID(), clientSignatureAlgorithm);
 
@@ -1055,13 +1065,20 @@ namespace LibUA
                     succeeded &= respBuf.Encode((uint)0xFFFFFFFFu);
 
                     // Server signature algorithm
-                    if (config.SecurityPolicy == SecurityPolicy.Basic256Sha256)
+                    switch (config.SecurityPolicy)
                     {
-                        succeeded &= respBuf.EncodeUAString(Types.SignatureAlgorithmSha256);
-                    }
-                    else
-                    {
-                        succeeded &= respBuf.EncodeUAString(Types.SignatureAlgorithmSha1);
+                        case SecurityPolicy.Basic256Sha256:
+                        case SecurityPolicy.Aes128_Sha256_RsaOaep:
+                            succeeded &= respBuf.EncodeUAString(Types.SignatureAlgorithmSha256);
+                            break;
+
+                        case SecurityPolicy.Aes256_Sha256_RsaPss:
+                            succeeded &= respBuf.EncodeUAString(Types.SignatureAlgorithmRsaPss256);
+                            break;
+
+                        default:
+                            succeeded &= respBuf.EncodeUAString(Types.SignatureAlgorithmSha1);
+                            break;
                     }
 
                     // Server signature
@@ -1479,6 +1496,14 @@ namespace LibUA
                     else if (securityPolicyUri == Types.SLSecurityPolicyUris[(int)SecurityPolicy.Basic256Sha256])
                     {
                         config.SecurityPolicy = SecurityPolicy.Basic256Sha256;
+                    }
+                    else if (securityPolicyUri == Types.SLSecurityPolicyUris[(int)SecurityPolicy.Aes128_Sha256_RsaOaep])
+                    {
+                        config.SecurityPolicy = SecurityPolicy.Aes128_Sha256_RsaOaep;
+                    }
+                    else if (securityPolicyUri == Types.SLSecurityPolicyUris[(int)SecurityPolicy.Aes256_Sha256_RsaPss])
+                    {
+                        config.SecurityPolicy = SecurityPolicy.Aes256_Sha256_RsaPss;
                     }
                     else
                     {
@@ -2796,7 +2821,9 @@ namespace LibUA
                 NodeId[] nodesToReturn = new NodeId[] { };
                 if (noOfNodesToRegister > 0)
                 {
-                    (status, nodesToReturn) = app.HandleRegisterNodesRequest(config.Session, nodesToRegister);
+                    var/*(status, nodesToReturn)*/res = app.HandleRegisterNodesRequest(config.Session, nodesToRegister);
+                    status = res.Item1;
+                    nodesToReturn = res.Item2;
                 }
 
                 var respBuf = new MemoryBuffer(maximumMessageSize);

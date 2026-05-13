@@ -5822,8 +5822,8 @@ namespace LibUA
 
         public class ExtensionObject
         {
-            private static ConcurrentDictionary<Type, Func<MemoryBuffer, NodeId>> _objectEncoders = new();
-            private static ConcurrentDictionary<NodeId, Func<MemoryBuffer, object>> _objectDecoders = new();
+            private static readonly ConcurrentDictionary<Type, Func<MemoryBuffer, NodeId>> _objectEncoders = new();
+            private static readonly ConcurrentDictionary<NodeId, Func<MemoryBuffer, object>> _objectDecoders = new();
             public static void RegisterEncoder<TObject>(Func<MemoryBuffer, NodeId> encoder)
             {
                 _objectEncoders[typeof(TObject)] = encoder;
@@ -7010,6 +7010,7 @@ namespace LibUA
             public TimeSpan PublishInterval, PublishKeepAliveInterval;
 
             public Dictionary<UInt32, MonitoredItem> MonitoredItems;
+            private readonly object monitoredItemsLock = new();
 
             public Subscription()
             {
@@ -7031,6 +7032,8 @@ namespace LibUA
                 ChangeNotification = ChangeNotificationType.None;
                 MonitoredItems = new Dictionary<uint, MonitoredItem>();
             }
+
+            public object MonitoredItemsSyncRoot => monitoredItemsLock;
         }
 
         public class SLSequence
