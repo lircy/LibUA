@@ -648,6 +648,10 @@ namespace LibUA
                     {
                         res[i] = new DataValue((int)nv9.ValueRank, StatusCode.Good);
                     }
+                    else if (readValueIds[i].AttributeId == NodeAttribute.ArrayDimensions && node is NodeVariable nv10)
+                    {
+                        res[i] = new DataValue(nv10.ArrayDimensions, StatusCode.Good);
+                    }
                     else
                     {
                         res[i] = new DataValue(null, StatusCode.BadAttributeIdInvalid);

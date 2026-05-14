@@ -446,12 +446,18 @@ namespace LibUA
                 get; protected set;
             }
 
-            public NodeVariable(NodeId Id, QualifiedName BrowseName, LocalizedText DisplayName, LocalizedText Description, UInt32 WriteMask, UInt32 UserWriteMask, Core.AccessLevel AccessLevel, Core.AccessLevel UserAccessLevel, double MinimumResamplingInterval, bool IsHistorizing, NodeId DataType, ValueRank DefaultRank = Core.ValueRank.Scalar)
+            public uint[] ArrayDimensions
+            {
+                get; set;
+            }
+
+            public NodeVariable(NodeId Id, QualifiedName BrowseName, LocalizedText DisplayName, LocalizedText Description, UInt32 WriteMask, UInt32 UserWriteMask, Core.AccessLevel AccessLevel, Core.AccessLevel UserAccessLevel, double MinimumResamplingInterval, bool IsHistorizing, NodeId DataType, ValueRank DefaultRank = Core.ValueRank.Scalar, uint[] ArrayDimensions = null)
                 : base(Id, NodeClass.ObjectType, BrowseName, DisplayName, Description, WriteMask, UserWriteMask)
             {
                 this.Value = null;
                 this.DataType = DataType;
                 this.ValueRank = (int)DefaultRank;
+                this.ArrayDimensions = ArrayDimensions ?? new uint[0];
 
                 this.AccessLevel = AccessLevel;
                 this.UserAccessLevel = UserAccessLevel;
