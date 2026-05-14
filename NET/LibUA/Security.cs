@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -965,6 +966,84 @@ namespace LibUA
         public static bool VerifyCertificate(X509Certificate2 senderCert)
         {
             return senderCert != null;
+        }
+
+        /// <summary>
+        /// Verify that the server certificate's Subject Alternative Name (SAN) contains
+        /// a DNS name or IP address matching the target hostname.
+        /// </summary>
+        public static bool VerifyCertificateHostname(X509Certificate2 serverCert, string targetHostname)
+        {
+            if (serverCert == null) return false;
+            try
+            {
+                var sanExt = serverCert.Extensions["2.5.29.17"];
+                if (sanExt == null) return false;
+
+                byte[] raw = sanExt.RawData;
+                int pos = 0;
+                if (raw.Length < 2 || raw[pos++] != 0x30) return false;
+                if ((raw[pos] & 0x80) != 0)
+                    pos += 1 + (raw[pos] & 0x7F);
+                else
+                    pos += 1;
+
+                while (pos < raw.Length)
+                {
+                    if (pos >= raw.Length) break;
+                    byte tag = raw[pos++];
+                    if (pos >= raw.Length) break;
+                    int len;
+                    if ((raw[pos] & 0x80) != 0)
+                    {
+                        int lenBytes = raw[pos] & 0x7F;
+                        len = 0;
+                        pos++;
+                        for (int i = 0; i < lenBytes && pos < raw.Length; i++)
+                            len = (len << 8) | raw[pos++];
+                    }
+                    else
+                    {
+                        len = raw[pos++];
+                    }
+
+                    if (pos + len > raw.Length) break;
+
+                    if (tag == 0x82) // DNS name entry
+                    {
+                        string dnsName = Encoding.UTF8.GetString(raw, pos, len);
+                        if (string.Equals(dnsName, targetHostname, StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                    else if (tag == 0x87) // IP address entry (binary)
+                    {
+                        IPAddress targetIp;
+                        if (IPAddress.TryParse(targetHostname, out targetIp))
+                        {
+                            byte[] targetIpBytes = targetIp.GetAddressBytes();
+                            if (len == targetIpBytes.Length)
+                            {
+                                bool match = true;
+                                for (int i = 0; i < len; i++)
+                                {
+                                    if (raw[pos + i] != targetIpBytes[i])
+                                    {
+                                        match = false;
+                                        break;
+                                    }
+                                }
+                                if (match) return true;
+                            }
+                        }
+                    }
+
+                    pos += len;
+                }
+            }
+            catch
+            {
+            }
+            return false;
         }
 
         public static byte[] SHACalculate(byte[] data, SecurityPolicy policy)

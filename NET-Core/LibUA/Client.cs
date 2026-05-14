@@ -27,6 +27,12 @@ namespace LibUA
 
         public readonly int Timeout;
 
+        /// <summary>
+        /// When set to true, skip hostname validation of the server certificate
+        /// (allows connecting even when BadCertificateHostNameInvalid would occur).
+        /// </summary>
+        public bool SkipCertificateHostnameCheck { get; set; } = false;
+
         protected SLChannel config = null;
         private int MaximumMessageSize;
         private Semaphore cs = null;
@@ -356,6 +362,11 @@ namespace LibUA
                         if (!UASecurity.VerifyCertificate(config.RemoteCertificate))
                         {
                             return StatusCode.BadCertificateInvalid;
+                        }
+
+                        if (!SkipCertificateHostnameCheck && !UASecurity.VerifyCertificateHostname(config.RemoteCertificate, Target))
+                        {
+                            return StatusCode.BadCertificateHostNameInvalid;
                         }
                     }
                     catch
